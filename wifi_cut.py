@@ -556,22 +556,25 @@ def run_diagnostics(iface: Optional[str] = None):
 
     print(f"{G}Monitor interface: {mon}{RS}")
 
-    print(f"{BD}[5] 10-second test scan on {mon}{RS}")
-    code, out, err = run_cmd(
-        ["timeout", "10", "airodump-ng", "--band", "abg", mon],
-        timeout=15,
-    )
-    if out.strip():
-        print(out)
-    if err.strip():
-        print(err)
+    lsusb_out = run_cmd(["lsusb"])[1]
+    virt = run_cmd(["systemd-detect-virt"])[1].strip()
+    if "VirtualBox" in lsusb_out or virt in ("oracle", "kvm", "qemu", "vmware"):
+        print(f"{Y}  Note: Kali appears to run in a VM. USB WiFi passthrough may limit scanning.{RS}")
+        print(f"{GR}  Prefer native Kali, or attach USB adapter via VM USB settings.{RS}")
 
-    if "No such device" in (out + err) or "fixed channel" in (out + err).lower():
-        print(f"{R}Scan failed on interface {mon}.{RS}")
-    elif "BSSID" in out or re.search(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", out):
-        print(f"{G}Scan OK — networks detected.{RS}")
+    print(f"{BD}[5] 15-second test scan on {mon}{RS}")
+    networks = scan_networks(mon, duration=15)
+    count = len(networks)
+    if count > 0:
+        print(f"{G}Scan OK — {count} network(s) detected:{RS}")
+        for i, net in enumerate(list(networks.values())[:8], 1):
+            print(f"  {i}. {net.display_name}  {net.bssid}  ch{net.channel}  {net.power} dBm")
+    elif "No such device" in run_cmd(["iw", "dev", mon, "info"])[2]:
+        print(f"{R}Scan failed — interface {mon} not available.{RS}")
     else:
-        print(f"{Y}No networks in 10s test — check signal or scan longer.{RS}")
+        print(f"{Y}No networks found in 15s.{RS}")
+        print(f"{GR}  Try longer scan: sudo python3 wifi_cut.py --scan 30{RS}")
+        print(f"{GR}  Or manual: sudo airodump-ng {mon}{RS}")
 
     print(f"\n{BD}[6] Restoring interface{RS}")
     for name in {mon, test_iface, f"{test_iface}mon"}:
