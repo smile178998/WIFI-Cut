@@ -222,6 +222,15 @@ def warn_encryption(net: Network):
         print(f"{GR}  Use aggressive mode (option 4) or test on WPA2/open networks.{RS}")
 
 
+def safe_input(prompt_text: str) -> Optional[str]:
+    """Read user input; return None on Ctrl+C or EOF."""
+    try:
+        return input(prompt_text).strip()
+    except (KeyboardInterrupt, EOFError):
+        print(f"\n{Y}Cancelled.{RS}")
+        return None
+
+
 def kill_conflicting_processes():
     print(f"{GR}Killing conflicting processes...{RS}")
     run_cmd(["airmon-ng", "check", "kill"], timeout=15)
@@ -413,20 +422,24 @@ def scan_networks(
     best_clients: Dict[str, List[Client]] = {}
     best_networks: Dict[str, Network] = {}
 
-    for i in range(duration):
-        remaining = duration - i
-        print(f"\r  {GR}Scanning {label} on {mon_iface}... {remaining:2d}s remaining{RS}", end="", flush=True)
-        time.sleep(1)
-        if i > 0 and i % 5 == 0:
-            nets, cbs = parse_airodump_csv(prefix)
-            best_networks.update(nets)
-            for bk, clist in cbs.items():
-                existing = best_clients.setdefault(bk, [])
-                for c in clist:
-                    if not any(x.mac == c.mac for x in existing):
-                        existing.append(c)
+    try:
+        for i in range(duration):
+            remaining = duration - i
+            print(f"\r  {GR}Scanning {label} on {mon_iface}... {remaining:2d}s remaining{RS}", end="", flush=True)
+            time.sleep(1)
+            if i > 0 and i % 5 == 0:
+                nets, cbs = parse_airodump_csv(prefix)
+                best_networks.update(nets)
+                for bk, clist in cbs.items():
+                    existing = best_clients.setdefault(bk, [])
+                    for c in clist:
+                        if not any(x.mac == c.mac for x in existing):
+                            existing.append(c)
+    except KeyboardInterrupt:
+        print(f"\n{Y}  Scan interrupted.{RS}")
 
-    proc.send_signal(signal.SIGINT)
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGINT)
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -671,100 +684,113 @@ def deauth_attack(
 
 
 def interactive_mode(mon_iface: str):
-    while True:
-        networks = scan_networks(mon_iface, duration=30)
-        display_networks(networks)
+    try:
+        while True:
+            networks = scan_networks(mon_iface, duration=30)
+            display_networks(networks)
 
-        if not networks:
-            choice = input(f"{C}Scan again? (y/n): {RS}").strip().lower()
-            if choice != "y":
+            if not networks:
+                choice = safe_input(f"{C}Scan again? (y/n): {RS}")
+                if choice is None or choice.lower() != "y":
+                    break
+                continue
+
+            sel = safe_input(f"{C}Select target # (0=quit): {RS}")
+            if sel is None:
                 break
-            continue
-
-        try:
-            sel = input(f"{C}Select target # (0=quit): {RS}").strip()
             if sel == "0" or not sel:
                 break
-            idx = int(sel)
-            sorted_nets = sorted(
-                networks.values(),
-                key=lambda n: int(n.power) if n.power.lstrip("-").isdigit() else -999,
-                reverse=True,
-            )
-            if idx < 1 or idx > len(sorted_nets):
-                print(f"{R}Invalid selection{RS}")
+            try:
+                idx = int(sel)
+                sorted_nets = sorted(
+                    networks.values(),
+                    key=lambda n: int(n.power) if n.power.lstrip("-").isdigit() else -999,
+                    reverse=True,
+                )
+                if idx < 1 or idx > len(sorted_nets):
+                    print(f"{R}Invalid selection{RS}")
+                    continue
+                target = sorted_nets[idx - 1]
+            except ValueError:
+                print(f"{R}Please enter a number{RS}")
                 continue
-            target = sorted_nets[idx - 1]
-        except ValueError:
-            print(f"{R}Please enter a number{RS}")
-            continue
 
-        warn_encryption(target)
-        target.clients = discover_clients(
-            mon_iface, target, duration=40, known_networks=networks,
-        )
-        display_clients(target)
-
-        client_macs = [c.mac for c in target.clients]
-
-        print(f"{BD}Disconnect options:{RS}")
-        print(f"  1. Disconnect all clients (standard)")
-        print(f"  2. Disconnect a specific client")
-        print(f"  3. Continuous disconnect (until stopped)")
-        print(f"  4. Aggressive disconnect (mdk4 + channel lock + flood)")
-        print(f"  5. Re-scan clients (30s)")
-        print(f"  0. Back to scan")
-
-        opt = input(f"{C}Choose action: {RS}").strip()
-
-        if opt == "0":
-            continue
-        elif opt == "5":
+            warn_encryption(target)
             target.clients = discover_clients(
-                mon_iface, target, duration=45, known_networks=networks,
+                mon_iface, target, duration=40, known_networks=networks,
             )
             display_clients(target)
-            continue
-        elif opt == "1":
-            count = input(f"{C}Deauth burst count (default 64): {RS}").strip()
-            count = int(count) if count.isdigit() else 64
-            deauth_attack(
-                mon_iface, target.bssid, channel=target.channel,
-                count=count, known_clients=client_macs,
-            )
-        elif opt == "2":
-            if not target.clients:
-                print(f"{Y}No clients detected — use option 1 or 4{RS}")
+
+            client_macs = [c.mac for c in target.clients]
+
+            print(f"{BD}Disconnect options:{RS}")
+            print(f"  1. Disconnect all clients (standard)")
+            print(f"  2. Disconnect a specific client")
+            print(f"  3. Continuous disconnect (until stopped)")
+            print(f"  4. Aggressive disconnect (mdk4 + channel lock + flood)")
+            print(f"  5. Re-scan clients (30s)")
+            print(f"  0. Back to scan")
+
+            opt = safe_input(f"{C}Choose action: {RS}")
+            if opt is None:
+                break
+
+            if opt == "0":
+                continue
+            elif opt == "5":
+                target.clients = discover_clients(
+                    mon_iface, target, duration=45, known_networks=networks,
+                )
+                display_clients(target)
+                continue
+            elif opt == "1":
+                count_raw = safe_input(f"{C}Deauth burst count (default 64): {RS}")
+                if count_raw is None:
+                    break
+                count = int(count_raw) if count_raw.isdigit() else 64
+                deauth_attack(
+                    mon_iface, target.bssid, channel=target.channel,
+                    count=count, known_clients=client_macs,
+                )
+            elif opt == "2":
+                if not target.clients:
+                    print(f"{Y}No clients detected — use option 1 or 4{RS}")
+                else:
+                    csel = safe_input(f"{C}Select client #: {RS}")
+                    if csel is None:
+                        break
+                    try:
+                        ci = int(csel)
+                        if 1 <= ci <= len(target.clients):
+                            count_raw = safe_input(f"{C}Deauth burst count (default 64): {RS}")
+                            if count_raw is None:
+                                break
+                            count = int(count_raw) if count_raw.isdigit() else 64
+                            deauth_attack(
+                                mon_iface,
+                                target.bssid,
+                                channel=target.channel,
+                                client_mac=target.clients[ci - 1].mac,
+                                count=count,
+                            )
+                        else:
+                            print(f"{R}Invalid selection{RS}")
+                    except ValueError:
+                        print(f"{R}Please enter a number{RS}")
+            elif opt == "3":
+                deauth_attack(
+                    mon_iface, target.bssid, channel=target.channel,
+                    count=0, known_clients=client_macs,
+                )
+            elif opt == "4":
+                deauth_attack(
+                    mon_iface, target.bssid, channel=target.channel,
+                    count=0, aggressive=True, known_clients=client_macs,
+                )
             else:
-                csel = input(f"{C}Select client #: {RS}").strip()
-                try:
-                    ci = int(csel)
-                    if 1 <= ci <= len(target.clients):
-                        count = input(f"{C}Deauth burst count (default 64): {RS}").strip()
-                        count = int(count) if count.isdigit() else 64
-                        deauth_attack(
-                            mon_iface,
-                            target.bssid,
-                            channel=target.channel,
-                            client_mac=target.clients[ci - 1].mac,
-                            count=count,
-                        )
-                    else:
-                        print(f"{R}Invalid selection{RS}")
-                except ValueError:
-                    print(f"{R}Please enter a number{RS}")
-        elif opt == "3":
-            deauth_attack(
-                mon_iface, target.bssid, channel=target.channel,
-                count=0, known_clients=client_macs,
-            )
-        elif opt == "4":
-            deauth_attack(
-                mon_iface, target.bssid, channel=target.channel,
-                count=0, aggressive=True, known_clients=client_macs,
-            )
-        else:
-            print(f"{R}Invalid option{RS}")
+                print(f"{R}Invalid option{RS}")
+    except KeyboardInterrupt:
+        print(f"\n{Y}Interrupted.{RS}")
 
 
 def run_diagnostics(iface: Optional[str] = None):
@@ -884,7 +910,9 @@ Examples:
             iface = ifaces[0]
             print(f"{GR}Auto-selected: {iface}{RS}")
         else:
-            sel = input(f"{C}Select interface #: {RS}").strip()
+            sel = safe_input(f"{C}Select interface #: {RS}")
+            if sel is None:
+                sys.exit(0)
             try:
                 iface = ifaces[int(sel) - 1]
             except (ValueError, IndexError):
@@ -934,6 +962,8 @@ Examples:
                 print(f"{Y}BSSID not found in scan results: {args.bssid}{RS}")
         else:
             interactive_mode(mon_iface)
+    except KeyboardInterrupt:
+        print(f"\n{Y}Interrupted.{RS}")
     finally:
         stop_monitor(mon_iface, iface)
         print(f"\n{G}Done. Interface restored.{RS}")
