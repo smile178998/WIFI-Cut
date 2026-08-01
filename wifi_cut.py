@@ -92,16 +92,104 @@ def check_dependencies():
         sys.exit(1)
 
 
+WLAN_IFACE_RE = re.compile(r"^(wlan|wlx|wlp|ath|wifi)\w*$", re.I)
+
+
+def is_wlan_iface(name: str) -> bool:
+    return bool(WLAN_IFACE_RE.match(name))
+
+
+def base_iface(iface: str) -> str:
+    """wlan0mon -> wlan0"""
+    if iface.endswith("mon") and len(iface) > 3 and is_wlan_iface(iface[:-3]):
+        return iface[:-3]
+    return iface
+
+
+def iface_mode(iface: str) -> str:
+    code, out, _ = run_cmd(["iw", "dev", iface, "info"])
+    if code != 0:
+        return "missing"
+    m = re.search(r"type\s+(\w+)", out, re.I)
+    return m.group(1).lower() if m else "unknown"
+
+
 def get_wifi_interfaces() -> List[str]:
+    """Return managed-mode interfaces for user selection (not monitor stubs)."""
     code, out, _ = run_cmd(["iw", "dev"])
     if code != 0:
         return []
-    interfaces = []
+
+    interfaces: List[str] = []
+    current_iface: Optional[str] = None
+
     for line in out.splitlines():
         m = re.match(r"\s*Interface\s+(\w+)", line)
         if m:
+            current_iface = m.group(1)
+            continue
+        if current_iface and re.search(r"type\s+managed", line, re.I):
+            if is_wlan_iface(current_iface):
+                interfaces.append(current_iface)
+            current_iface = None
+
+    if interfaces:
+        return interfaces
+
+    # Fallback: any wlan interface (e.g. already in monitor mode)
+    for line in out.splitlines():
+        m = re.match(r"\s*Interface\s+(\w+)", line)
+        if m and is_wlan_iface(m.group(1)):
             interfaces.append(m.group(1))
+
     return interfaces
+
+
+def find_monitor_interfaces() -> List[str]:
+    """Find all interfaces currently in monitor mode."""
+    code, out, _ = run_cmd(["iw", "dev"])
+    if code != 0:
+        return []
+
+    candidates: List[str] = []
+    current_iface: Optional[str] = None
+
+    for line in out.splitlines():
+        m = re.match(r"\s*Interface\s+(\w+)", line)
+        if m:
+            current_iface = m.group(1)
+            continue
+        if current_iface and re.search(r"type\s+monitor", line, re.I):
+            if is_wlan_iface(current_iface):
+                candidates.append(current_iface)
+            current_iface = None
+
+    return candidates
+
+
+def resolve_monitor_iface(base: str, airmon_output: str = "") -> Optional[str]:
+    """Pick the correct monitor interface; never return phy* names."""
+    preferred = [f"{base}mon", base]
+    monitors = find_monitor_interfaces()
+
+    for name in preferred:
+        if name in monitors:
+            return name
+
+    for name in monitors:
+        if name.startswith(base):
+            return name
+
+    for name in re.findall(r"\[(\w+)\]", airmon_output):
+        if is_wlan_iface(name) and (name.startswith(base) or name == f"{base}mon"):
+            if iface_mode(name) == "monitor":
+                return name
+
+    for name in preferred:
+        if iface_mode(name) == "monitor":
+            return name
+
+    return None
 
 
 def kill_conflicting_processes():
@@ -110,65 +198,39 @@ def kill_conflicting_processes():
 
 
 def find_monitor_interface(original_iface: str) -> Optional[str]:
-    """Find an interface currently in monitor mode."""
-    code, out, _ = run_cmd(["iw", "dev"])
-    if code != 0:
-        return None
-
-    candidates: List[str] = []
-    current_iface: Optional[str] = None
-    is_monitor = False
-
-    for line in out.splitlines():
-        m = re.match(r"\s*Interface\s+(\w+)", line)
-        if m:
-            current_iface = m.group(1)
-            is_monitor = False
-        if current_iface and re.search(r"type\s+monitor", line, re.I):
-            is_monitor = True
-            candidates.append(current_iface)
-            current_iface = None
-            is_monitor = False
-
-    for name in candidates:
-        if name.startswith(original_iface) or original_iface in name:
-            return name
-    return candidates[0] if candidates else None
+    return resolve_monitor_iface(base_iface(original_iface))
 
 
 def start_monitor(iface: str) -> str:
     """Switch interface to monitor mode and return monitor interface name."""
+    base = base_iface(iface)
+
+    existing = resolve_monitor_iface(base)
+    if existing:
+        return existing
+
     kill_conflicting_processes()
-    code, out, err = run_cmd(["airmon-ng", "start", iface], timeout=20)
+
+    start_name = base if iface_mode(base) != "missing" else iface
+    code, out, err = run_cmd(["airmon-ng", "start", start_name], timeout=20)
     combined = out + err
 
-    # Prefer explicit airmon-ng message: "monitor mode enabled on [wlan0mon]"
-    m = re.search(r"monitor mode.*?\[(\w+)\]", combined, re.I)
-    if m and not m.group(1).startswith("phy"):
-        mon = m.group(1)
-        code3, out3, _ = run_cmd(["iw", "dev", mon, "info"])
-        if code3 == 0 and "monitor" in out3.lower():
-            return mon
-
-    mon = find_monitor_interface(iface)
+    mon = resolve_monitor_iface(base, combined)
     if mon:
         return mon
 
-    for candidate in (f"{iface}mon", iface):
-        code3, out3, _ = run_cmd(["iw", "dev", candidate, "info"])
-        if code3 == 0 and "monitor" in out3.lower():
-            return candidate
-
-    print(f"{R}Failed to enable monitor mode. Output: {combined}{RS}")
+    print(f"{R}Failed to enable monitor mode.{RS}")
+    print(f"{GR}airmon-ng output:{RS}\n{combined}")
+    print(f"{Y}Run diagnostics: sudo python3 wifi_cut.py --check{RS}")
     sys.exit(1)
 
 
 def stop_monitor(mon_iface: str, original_iface: str):
     print(f"{GR}Restoring interface mode...{RS}")
-    run_cmd(["airmon-ng", "stop", mon_iface], timeout=15)
-    if mon_iface != original_iface:
-        run_cmd(["airmon-ng", "stop", original_iface], timeout=15)
-    run_cmd(["airmon-ng", "stop", f"{original_iface}mon"], timeout=15)
+    base = base_iface(original_iface)
+    for name in {mon_iface, original_iface, f"{base}mon", base}:
+        if is_wlan_iface(name):
+            run_cmd(["airmon-ng", "stop", name], timeout=15)
 
 
 def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[Client]]]:
@@ -242,12 +304,12 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
     proc = subprocess.Popen(
         ["airodump-ng", "--band", "abg", "--output-format", "csv", "-w", prefix, mon_iface],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
 
     for i in range(duration):
         remaining = duration - i
-        print(f"\r  {GR}Scanning... {remaining:2d}s remaining{RS}", end="", flush=True)
+        print(f"\r  {GR}Scanning on {mon_iface}... {remaining:2d}s remaining{RS}", end="", flush=True)
         time.sleep(1)
 
     proc.send_signal(signal.SIGINT)
@@ -257,11 +319,23 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
         proc.kill()
         proc.wait(timeout=3)
 
+    scan_err = ""
+    if proc.stderr:
+        scan_err = proc.stderr.read().decode("utf-8", errors="replace").strip()
+
     time.sleep(1)  # allow airodump-ng to flush CSV
 
     print(f"\r  {G}Scan complete!{RS}                         ")
 
     networks, _ = parse_airodump_csv(prefix)
+
+    if not networks:
+        if scan_err:
+            print(f"{Y}  airodump-ng: {scan_err}{RS}")
+        ap_file = f"{prefix}-01.csv"
+        if not os.path.exists(ap_file):
+            print(f"{Y}  No scan data file — interface '{mon_iface}' may be invalid.{RS}")
+            print(f"{Y}  Try: sudo python3 wifi_cut.py --check{RS}")
 
     for f in Path(tmp_dir).glob("*"):
         f.unlink(missing_ok=True)
@@ -442,6 +516,70 @@ def interactive_mode(mon_iface: str):
             print(f"{R}Invalid option{RS}")
 
 
+def run_diagnostics(iface: Optional[str] = None):
+    """Print hardware/driver checks to help debug scan issues."""
+    print(f"\n{BD}{C}=== WiFi Cut Diagnostics ==={RS}\n")
+
+    print(f"{BD}[1] iw dev (wireless interfaces){RS}")
+    code, out, err = run_cmd(["iw", "dev"])
+    print(out or err or "(empty)")
+
+    print(f"{BD}[2] lsusb (USB adapters){RS}")
+    code, out, err = run_cmd(["lsusb"])
+    print(out or err or "(empty)")
+
+    print(f"{BD}[3] airmon-ng{RS}")
+    code, out, err = run_cmd(["airmon-ng"])
+    print(out or err or "(empty)")
+
+    ifaces = get_wifi_interfaces()
+    if not ifaces and iface:
+        ifaces = [iface]
+    if not ifaces:
+        print(f"{R}No managed wireless interface found.{RS}")
+        return
+
+    test_iface = base_iface(iface or ifaces[0])
+    print(f"{BD}[4] Testing monitor mode on {test_iface}{RS}")
+    print(f"{GR}Current mode: {iface_mode(test_iface)}{RS}")
+
+    kill_conflicting_processes()
+    code, out, err = run_cmd(["airmon-ng", "start", test_iface], timeout=20)
+    combined = out + err
+    print(combined)
+
+    mon = resolve_monitor_iface(test_iface, combined)
+    if not mon:
+        print(f"{R}Monitor mode FAILED — adapter may not support monitor mode.{RS}")
+        print(f"{Y}Try an external adapter (e.g. Alfa AWUS036ACH).{RS}")
+        return
+
+    print(f"{G}Monitor interface: {mon}{RS}")
+
+    print(f"{BD}[5] 10-second test scan on {mon}{RS}")
+    code, out, err = run_cmd(
+        ["timeout", "10", "airodump-ng", "--band", "abg", mon],
+        timeout=15,
+    )
+    if out.strip():
+        print(out)
+    if err.strip():
+        print(err)
+
+    if "No such device" in (out + err) or "fixed channel" in (out + err).lower():
+        print(f"{R}Scan failed on interface {mon}.{RS}")
+    elif "BSSID" in out or re.search(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", out):
+        print(f"{G}Scan OK — networks detected.{RS}")
+    else:
+        print(f"{Y}No networks in 10s test — check signal or scan longer.{RS}")
+
+    print(f"\n{BD}[6] Restoring interface{RS}")
+    for name in {mon, test_iface, f"{test_iface}mon"}:
+        if is_wlan_iface(name):
+            run_cmd(["airmon-ng", "stop", name], timeout=10)
+    print(f"{G}Done.{RS}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="WiFi Cut - Kali WiFi scanner and disconnect tool",
@@ -452,9 +590,11 @@ Examples:
   sudo python3 wifi_cut.py -i wlan0           # specify interface
   sudo python3 wifi_cut.py -i wlan0 --scan 30 # scan for 30 seconds
   sudo python3 wifi_cut.py -i wlan0 -b AA:BB:CC:DD:EE:FF --deauth-all
+  sudo python3 wifi_cut.py --check              # diagnose scan issues
         """,
     )
     parser.add_argument("-i", "--interface", help="Wireless interface (e.g. wlan0)")
+    parser.add_argument("--check", action="store_true", help="Run diagnostics (no attack)")
     parser.add_argument("--scan", type=int, default=15, metavar="SEC", help="Scan duration in seconds")
     parser.add_argument("-b", "--bssid", help="Target AP BSSID")
     parser.add_argument("-c", "--client", help="Target client MAC (optional)")
@@ -466,6 +606,10 @@ Examples:
     print(BANNER)
     require_root()
     check_dependencies()
+
+    if args.check:
+        run_diagnostics(args.interface)
+        return
 
     ifaces = get_wifi_interfaces()
     if not ifaces:
@@ -493,7 +637,11 @@ Examples:
 
     print(f"\n{G}Using interface: {iface}{RS}")
     mon_iface = start_monitor(iface)
-    print(f"{G}Monitor mode: {mon_iface}{RS}")
+    if not is_wlan_iface(mon_iface):
+        print(f"{R}Invalid monitor interface: {mon_iface}{RS}")
+        print(f"{Y}Run: sudo python3 wifi_cut.py --check{RS}")
+        sys.exit(1)
+    print(f"{G}Monitor interface: {mon_iface}{RS}")
 
     try:
         if args.bssid and (args.deauth_all or args.client or args.continuous):
