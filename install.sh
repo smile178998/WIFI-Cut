@@ -1,31 +1,31 @@
 #!/bin/bash
-# WiFi Cut - Kali Linux 安装脚本
+# WiFi Cut - Kali Linux install script
 
 set -e
 
 echo "======================================"
-echo "  WiFi Cut 安装"
+echo "  WiFi Cut Setup"
 echo "======================================"
 
 if [ "$EUID" -ne 0 ]; then
-    echo "请使用 sudo 运行: sudo bash install.sh"
+    echo "Please run with sudo: sudo bash install.sh"
     exit 1
 fi
 
-echo "[1/3] 更新软件包..."
+echo "[1/3] Updating packages..."
 apt update -qq
 
-echo "[2/3] 安装依赖..."
+echo "[2/3] Installing dependencies..."
 apt install -y aircrack-ng iw wireless-tools
 
-echo "[3/3] 设置权限..."
+echo "[3/3] Setting permissions..."
 chmod +x wifi_cut.py
 
 echo ""
-echo "安装完成！"
+echo "Installation complete!"
 echo ""
-echo "使用方法："
-echo "  sudo python3 wifi_cut.py          # 交互模式"
-echo "  sudo python3 wifi_cut.py -i wlan0 # 指定网卡"
+echo "Usage:"
+echo "  sudo python3 wifi_cut.py          # interactive mode"
+echo "  sudo python3 wifi_cut.py -i wlan0 # specify interface"
 echo ""
-echo "⚠  仅在你拥有或已获授权的网络上使用！"
+echo "⚠  Use only on networks you own or are authorized to test!"

