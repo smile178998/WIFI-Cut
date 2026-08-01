@@ -1,0 +1,5 @@
+# WiFi Cut 主要依赖系统工具（Kali 已预装）：
+#   aircrack-ng  (airmon-ng, airodump-ng, aireplay-ng)
+#   iw
+#
+# Python 无额外第三方依赖，仅需 Python 3.8+
