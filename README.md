@@ -2,7 +2,7 @@
 
 [![Kali Linux](https://img.shields.io/badge/Platform-Kali%20Linux-blue)](https://www.kali.org/)
 [![Python 3](https://img.shields.io/badge/Python-3.8+-green)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-Educational%20Use-only)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Scan nearby WiFi networks and phone hotspots on **Kali Linux**, discover connected clients, and disconnect them using deauth attacks.
 
@@ -52,10 +52,10 @@ sudo python3 wifi_cut.py --check
 | Adapter | Chipset | Notes |
 |---------|---------|-------|
 | TP-Link TL-WN722N **v1** | AR9271 | Recommended, works out of the box |
-| Alfa AWUS036ACH | ó | Popular pentest adapter |
-| Many built-in laptop WiFi | ó | Often **do not** support monitor mode |
+| Alfa AWUS036ACH | ù | Popular pentest adapter |
+| Many built-in laptop WiFi | ù | Often **do not** support monitor mode |
 
-> **WN722N v2/v3** (Realtek) have poor Linux monitor support. Check with `lsusb` ó v1 shows `AR9271`.
+> **WN722N v2/v3** (Realtek) have poor Linux monitor support. Check with `lsusb` ù v1 shows `AR9271`.
 
 ---
 
@@ -110,14 +110,14 @@ sudo python3 wifi_cut.py
 | `1` | Disconnect all clients (standard deauth) |
 | `2` | Disconnect one specific client |
 | `3` | Continuous disconnect until Ctrl+C |
-| `4` | **Aggressive** ó mdk4 flood + channel lock + heavy deauth |
+| `4` | **Aggressive** ù mdk4 flood + channel lock + heavy deauth |
 | `5` | Re-scan clients (45s) |
 | `0` | Back to WiFi list |
 
 **Tips for client discovery:**
 
 - Keep phones/laptops **actively using** the target WiFi (video, download)
-- Enterprise SSIDs may have multiple APs with the same name ó the tool matches by SSID
+- Enterprise SSIDs may have multiple APs with the same name ù the tool matches by SSID
 - If clients = 0, use option `5` or option `4` (works without client list)
 
 ### Command line
@@ -150,8 +150,8 @@ sudo python3 wifi_cut.py -i wlan0 -b AA:BB:CC:DD:EE:FF -c 11:22:33:44:55:66 --de
   1    ?? iPhone               AA:BB:CC:DD:EE:FF  6     -45 dBm WPA2     2
 ```
 
-- **??** ó likely phone hotspot / tethering
-- **Clients** ó devices seen during passive scan (0 = none detected yet, not necessarily empty)
+- **??** ù likely phone hotspot / tethering
+- **Clients** ù devices seen during passive scan (0 = none detected yet, not necessarily empty)
 
 ---
 
@@ -204,7 +204,7 @@ If this shows networks, WiFi Cut should work too.
 | Limitation | Explanation |
 |------------|-------------|
 | WPA3 + PMF | Many routers ignore forged deauth frames |
-| 4G/5G cellular | Cannot cut mobile data ó only WiFi / hotspots |
+| 4G/5G cellular | Cannot cut mobile data ù only WiFi / hotspots |
 | VirtualBox | USB passthrough may reduce scan/injection reliability |
 | Passive client scan | Idle devices may not appear until they send traffic |
 
