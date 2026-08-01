@@ -109,21 +109,50 @@ def kill_conflicting_processes():
     run_cmd(["airmon-ng", "check", "kill"], timeout=15)
 
 
+def find_monitor_interface(original_iface: str) -> Optional[str]:
+    """Find an interface currently in monitor mode."""
+    code, out, _ = run_cmd(["iw", "dev"])
+    if code != 0:
+        return None
+
+    candidates: List[str] = []
+    current_iface: Optional[str] = None
+    is_monitor = False
+
+    for line in out.splitlines():
+        m = re.match(r"\s*Interface\s+(\w+)", line)
+        if m:
+            current_iface = m.group(1)
+            is_monitor = False
+        if current_iface and re.search(r"type\s+monitor", line, re.I):
+            is_monitor = True
+            candidates.append(current_iface)
+            current_iface = None
+            is_monitor = False
+
+    for name in candidates:
+        if name.startswith(original_iface) or original_iface in name:
+            return name
+    return candidates[0] if candidates else None
+
+
 def start_monitor(iface: str) -> str:
     """Switch interface to monitor mode and return monitor interface name."""
     kill_conflicting_processes()
     code, out, err = run_cmd(["airmon-ng", "start", iface], timeout=20)
     combined = out + err
 
-    m = re.search(r"\[(\w+)\]", combined)
-    if m:
-        return m.group(1)
+    # Prefer explicit airmon-ng message: "monitor mode enabled on [wlan0mon]"
+    m = re.search(r"monitor mode.*?\[(\w+)\]", combined, re.I)
+    if m and not m.group(1).startswith("phy"):
+        mon = m.group(1)
+        code3, out3, _ = run_cmd(["iw", "dev", mon, "info"])
+        if code3 == 0 and "monitor" in out3.lower():
+            return mon
 
-    code2, out2, _ = run_cmd(["iw", "dev"])
-    for line in out2.splitlines():
-        m2 = re.match(r"\s*Interface\s+(\w+)", line)
-        if m2 and m2.group(1).startswith(iface):
-            return m2.group(1)
+    mon = find_monitor_interface(iface)
+    if mon:
+        return mon
 
     for candidate in (f"{iface}mon", iface):
         code3, out3, _ = run_cmd(["iw", "dev", candidate, "info"])
@@ -137,7 +166,9 @@ def start_monitor(iface: str) -> str:
 def stop_monitor(mon_iface: str, original_iface: str):
     print(f"{GR}Restoring interface mode...{RS}")
     run_cmd(["airmon-ng", "stop", mon_iface], timeout=15)
-    run_cmd(["airmon-ng", "stop", original_iface], timeout=15)
+    if mon_iface != original_iface:
+        run_cmd(["airmon-ng", "stop", original_iface], timeout=15)
+    run_cmd(["airmon-ng", "stop", f"{original_iface}mon"], timeout=15)
 
 
 def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[Client]]]:
@@ -209,7 +240,7 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
     print(f"{GR}Includes routers, WiFi APs, and phone hotspots/tethering{RS}\n")
 
     proc = subprocess.Popen(
-        ["airodump-ng", "--output-format", "csv", "-w", prefix, mon_iface],
+        ["airodump-ng", "--band", "abg", "--output-format", "csv", "-w", prefix, mon_iface],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -224,6 +255,9 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait(timeout=3)
+
+    time.sleep(1)  # allow airodump-ng to flush CSV
 
     print(f"\r  {G}Scan complete!{RS}                         ")
 
