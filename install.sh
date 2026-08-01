@@ -16,7 +16,7 @@ echo "[1/3] Updating packages..."
 apt update -qq
 
 echo "[2/3] Installing dependencies..."
-apt install -y aircrack-ng iw wireless-tools
+apt install -y aircrack-ng iw wireless-tools mdk4
 
 echo "[3/3] Setting permissions..."
 chmod +x wifi_cut.py

