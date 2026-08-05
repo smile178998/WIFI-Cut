@@ -38,11 +38,11 @@ __        _____ _____ ___    ____ _   _ _____
 
 BANNER = f"""
 {BD}{C}{_ASCII_LOGO}{RS}
-{GR}          v1.0  ·  wireless scan & deauth  ·  Kali Linux{RS}
+{GR}v1.0  ·  wireless scan & deauth {RS}
 
-{GR}  scan{RS}   {GR}deauth{RS}   {GR}monitor{RS}
+{GR}scan{RS}   {GR}deauth{RS}   {GR}monitor{RS}
 
-{Y}  authorized use only — test networks you own or have permission{RS}
+{Y}authorized use only — test networks you own or have permission{RS}
 """
 
 
