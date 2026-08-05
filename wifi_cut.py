@@ -25,16 +25,22 @@ C  = "\033[96m"
 B  = "\033[94m"
 W  = "\033[97m"
 GR = "\033[90m"
+M  = "\033[95m"  # magenta — hacker accent
 BD = "\033[1m"
 RS = "\033[0m"
 
 BANNER = f"""
-{BD}{C}╔══════════════════════════════════════════════════════════╗
-║              WiFi Cut  -  Wireless Network Tool          ║
-║        Scan WiFi / Hotspots  ·  Disconnect Clients       ║
-╚══════════════════════════════════════════════════════════╝{RS}
-{R}  ⚠  WARNING: Use only on networks you own or are authorized to test!{RS}
-{R}  ⚠  Unauthorized interference is illegal in most jurisdictions.{RS}
+{GR}    ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄{RS}
+{M}    █{RS} {BD}{G}WIFI{RS}{GR}::{RS}{BD}{C}CUT{RS}{M} █{RS}  {GR}wireless intrusion & deauth framework{RS}
+{M}    █{RS} {BD}{GR}[ RF_SIEGE MODULE ]{RS}  {GR}build 1.0 // kali-linux{RS}{M} █{RS}
+{GR}    ▀▀▀▀▀▀▀ ▀▀▀▀▀▀▀ ▀▀▀▀▀▀▀ ▀▀▀▀▀▀▀ ▀▀▀▀▀▀▀ ▀▀▀▀▀▀▀ ▀▀▀▀▀▀▀ ▀▀▀▀▀▀▀{RS}
+{GR}  ┌──────────────────────────────────────────────────────────────┐{RS}
+{GR}  │{RS} {G}▸{RS} {W}SCAN{RS}     passive recon · AP discovery · client enumeration{GR}       │{RS}
+{GR}  │{RS} {R}▸{RS} {W}DEAUTH{RS}   802.11 disconnect · channel siege · mdk4 flood{GR}         │{RS}
+{GR}  │{RS} {C}▸{RS} {W}MONITOR{RS} airmon-ng · airodump-ng · aireplay-ng{GR}                 │{RS}
+{GR}  └──────────────────────────────────────────────────────────────┘{RS}
+{R}  [!] AUTHORIZED USE ONLY — owned networks / written permission{RS}
+{R}  [!] UNAUTHORIZED RF INTERFERENCE IS A CRIMINAL OFFENSE{RS}
 """
 
 
